@@ -56,6 +56,7 @@ import { SpecEditor } from './SpecEditor';
 import { SpecOverview } from './SpecOverview';
 import { UiSurfacesTabPane } from './UiSurfacesTabPane';
 import { AuditTimelinePane } from './AuditTimelinePane';
+import { PreviewPromptPanel } from './PreviewPromptPanel';
 import { VersionsTab } from './VersionsTab';
 import { useSpecEvents } from './useSpecEvents';
 
@@ -657,6 +658,12 @@ export function Workspace({ initialDraft }: WorkspaceProps): React.ReactElement 
                       spec: { ...prev.spec, persona: next },
                     }));
                   }}
+                />
+                {/* Issue #55 — live compiled-prompt preview panel.
+                 *  Refetches whenever the draft state changes. */}
+                <PreviewPromptPanel
+                  draftId={draft.id}
+                  refetchKey={draft.updatedAt}
                 />
               </div>
             )}

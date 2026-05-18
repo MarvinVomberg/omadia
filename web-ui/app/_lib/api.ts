@@ -1951,6 +1951,49 @@ export async function runOperatorPrivacyLiveTest(
   });
 }
 
+// ── Builder preview prompt (issue #55) ──────────────────────────────────────
+
+export interface PreviewPromptSection {
+  label: string;
+  content: string;
+  kind: 'header' | 'persona' | 'boundaries' | 'sycophancy' | 'skill' | 'custom_notes';
+}
+
+export interface BuilderPreviewPrompt {
+  systemPrompt: string;
+  tokens: number;
+  sections: PreviewPromptSection[];
+}
+
+/**
+ * Issue #55 — render the live compiled system prompt for a draft.
+ * POST so the route can carry future options (token-count mode, etc.)
+ * without breaking the GET surface.
+ */
+export async function fetchBuilderPreviewPrompt(
+  draftId: string,
+): Promise<BuilderPreviewPrompt> {
+  const forwarded = await forwardCookieHeader();
+  const res = await fetch(
+    botApi(`/v1/builder/drafts/${encodeURIComponent(draftId)}/preview-prompt`),
+    {
+      method: 'POST',
+      headers: { accept: 'application/json', ...forwarded },
+      credentials: 'include',
+      cache: 'no-store',
+    },
+  );
+  const text = await res.text();
+  if (!res.ok) {
+    throw new ApiError(
+      res.status,
+      `POST /v1/builder/drafts/${draftId}/preview-prompt failed: ${res.status}`,
+      text,
+    );
+  }
+  return JSON.parse(text) as BuilderPreviewPrompt;
+}
+
 // ── Builder audit log (issue #57) ───────────────────────────────────────────
 
 export interface BuilderAuditEvent {
