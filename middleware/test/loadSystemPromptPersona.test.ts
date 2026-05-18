@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import {
   composePersonaFromAgentMd,
+  composeSycophancyFromAgentMd,
   inferFamilyFromModel,
 } from '../src/plugins/dynamicAgentRuntime.js';
 
@@ -162,5 +163,96 @@ persona:
     );
     const out = await composePersonaFromAgentMd(pkgRoot, 'claude-sonnet-4-6');
     assert.equal(out, '');
+  });
+});
+
+describe('composeSycophancyFromAgentMd (issue #51)', () => {
+  let pkgRoot: string;
+
+  beforeEach(async () => {
+    pkgRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'sycophancy-rt-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(pkgRoot, { recursive: true, force: true });
+  });
+
+  it("returns '' when AGENT.md is missing (legacy plugin)", async () => {
+    assert.equal(await composeSycophancyFromAgentMd(pkgRoot), '');
+  });
+
+  it("returns '' when AGENT.md has no quality block", async () => {
+    await fs.writeFile(
+      path.join(pkgRoot, 'AGENT.md'),
+      `---
+identity:
+  id: foo
+---
+
+# Body
+`,
+    );
+    assert.equal(await composeSycophancyFromAgentMd(pkgRoot), '');
+  });
+
+  it("returns '' when quality.sycophancy is 'off'", async () => {
+    await fs.writeFile(
+      path.join(pkgRoot, 'AGENT.md'),
+      `---
+quality:
+  sycophancy: off
+---
+
+# Body
+`,
+    );
+    assert.equal(await composeSycophancyFromAgentMd(pkgRoot), '');
+  });
+
+  it("compiles the medium tier when quality.sycophancy: medium", async () => {
+    await fs.writeFile(
+      path.join(pkgRoot, 'AGENT.md'),
+      `---
+quality:
+  sycophancy: medium
+---
+
+# Body
+`,
+    );
+    const out = await composeSycophancyFromAgentMd(pkgRoot);
+    assert.match(out, /^## Critical Thinking Guidelines\n/);
+    assert.match(out, /alternative approach/);
+  });
+
+  it("compiles the high tier when quality.sycophancy: high", async () => {
+    await fs.writeFile(
+      path.join(pkgRoot, 'AGENT.md'),
+      `---
+quality:
+  sycophancy: high
+---
+
+# Body
+`,
+    );
+    const out = await composeSycophancyFromAgentMd(pkgRoot);
+    assert.match(out, /^## Anti-Sycophancy Protocol \(STRICT/);
+    assert.equal((out.match(/MANDATORY:/g) ?? []).length, 3);
+  });
+
+  it("falls through to agent.md when AGENT.md is absent", async () => {
+    await fs.writeFile(
+      path.join(pkgRoot, 'agent.md'),
+      `---
+quality:
+  sycophancy: low
+---
+
+# Legacy hand-authored plugin
+`,
+    );
+    const out = await composeSycophancyFromAgentMd(pkgRoot);
+    assert.match(out, /^## Accuracy Guidelines\n/);
   });
 });
