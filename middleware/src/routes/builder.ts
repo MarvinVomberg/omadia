@@ -36,6 +36,10 @@ import {
   type BuilderEditDeps,
 } from './builderEdit.js';
 import {
+  registerBuilderPreviewPromptRoute,
+  type BuilderPreviewPromptDeps,
+} from './builderPreviewPrompt.js';
+import {
   registerBuilderEventsRoutes,
   type BuilderEventsDeps,
 } from './builderEvents.js';
@@ -78,6 +82,9 @@ export interface BuilderRouterDeps {
   /** Audit-log GET surface (issue #56). When omitted, the
    *  GET /drafts/:id/audit endpoint stays absent. */
   audit?: BuilderAuditDeps;
+  /** Preview-prompt POST surface (issue #55). When omitted, the
+   *  POST /drafts/:id/preview-prompt endpoint stays absent. */
+  previewPrompt?: BuilderPreviewPromptDeps;
   /** SSE event-bus stream (B.5-4). When omitted, the
    *  GET /drafts/:id/events endpoint stays absent. Wired by `index.ts`
    *  alongside the chat + edit surfaces — a single SpecEventBus instance
@@ -453,6 +460,11 @@ export function createBuilderRouter(deps: BuilderRouterDeps): Router {
   // ── Builder audit-log GET (issue #56) ──────────────────────────────────
   if (deps.audit) {
     registerBuilderAuditRoute(router, deps.audit);
+  }
+
+  // ── Builder preview-prompt POST (issue #55) ────────────────────────────
+  if (deps.previewPrompt) {
+    registerBuilderPreviewPromptRoute(router, deps.previewPrompt);
   }
 
   // ── Builder SSE event stream (B.5-4) ──────────────────────────────────
