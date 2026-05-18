@@ -26,6 +26,7 @@ import type { JobScheduler } from './jobScheduler.js';
 import type { PluginCatalog, PluginCatalogEntry } from './manifestLoader.js';
 import { composePersonaSection } from './personaCompose.js';
 import type { PersonaModelFamily } from './personaDelta.js';
+import { compileSycophancyGuard } from './sycophancyGuard.js';
 import { topoSortByDependsOn } from './topoSort.js';
 import type { UploadedPackageStore } from './uploadedPackageStore.js';
 import { zodToJsonSchema } from './zodToJsonSchema.js';
@@ -561,12 +562,43 @@ async function loadSystemPrompt(
   // simply get no persona injection. Read failures are swallowed so a
   // mis-packaged plugin doesn't take down activation.
   const personaSection = await composePersonaFromAgentMd(packageRoot, modelId);
+  const sycophancySection = await composeSycophancyFromAgentMd(packageRoot);
 
   const header = buildHeader(entry);
   const parts: string[] = [header];
   if (personaSection.length > 0) parts.push(personaSection);
+  if (sycophancySection.length > 0) parts.push(sycophancySection);
   if (skillParts.length > 0) parts.push(skillParts.join('\n\n---\n\n'));
   return parts.join('\n\n---\n\n');
+}
+
+/**
+ * Issue #51 — read the plugin's AGENT.md (if present), parse the
+ * frontmatter, and compile the sycophancy-guard rule package for the
+ * configured tier (`quality.sycophancy`). Returns `''` when:
+ *   - no AGENT.md or agent.md file at the package root
+ *   - file read fails
+ *   - frontmatter is missing / malformed
+ *   - `quality.sycophancy` is absent, `undefined`, or `'off'`
+ *
+ * Sits between persona (tone) and skill (task instructions) in the
+ * compiled system prompt. Final compose order with F4 (boundaries) will
+ * be `[header, persona, boundaries, sycophancy, skill]`.
+ */
+export async function composeSycophancyFromAgentMd(packageRoot: string): Promise<string> {
+  for (const candidate of ['AGENT.md', 'agent.md']) {
+    const p = path.join(packageRoot, candidate);
+    let content: string;
+    try {
+      content = await fs.readFile(p, 'utf-8');
+    } catch {
+      continue;
+    }
+    const parsed = parseAgentMd(content);
+    const level = parsed.frontmatter?.quality?.sycophancy;
+    return compileSycophancyGuard(level);
+  }
+  return '';
 }
 
 /**
