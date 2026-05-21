@@ -1,6 +1,6 @@
 /**
  * Tool-side PII field annotations — Privacy-Shield v3 (stable-id
- * tokenization, slice 1).
+ * tokenization).
  *
  * Motivation
  * ----------
@@ -38,19 +38,34 @@
  *
  * Path syntax
  * -----------
- * `path` and `idPath` use a dotted notation with `[]` as the
- * array-spread marker. Supported shapes (slice 1):
+ * `path` and `idPath` are step sequences. Each step is one of:
  *
- *   - `"name"`                            — top-level field
- *   - `"user.name"`                       — nested object
- *   - `"employees[].name"`                — array of objects, one per row
- *   - `"employees[].partner.name"`        — array of nested objects
+ *   - `key`   — descend into an object property (`name`, `partner`).
+ *   - `[]`    — spread across every element of an array. May appear at
+ *               the head of the path when the tool result is itself a
+ *               top-level array (Odoo `search_read` → `[{…}]`).
+ *   - `[N]`   — descend into a fixed array index. The motivating case
+ *               is Odoo's many2one wire format `field: [id, label]`,
+ *               where `field[1]` is the label and `field[0]` the id.
  *
- * Not supported in slice 1: array indices (`employees[0].name`),
- * wildcards across object keys, or non-uniform shapes. Both `path`
- * and `idPath` must walk through the same `[]` spreads in the same
- * order — `employees[].name` pairs with `employees[].employee_id`,
- * not `employees[].partner.id`.
+ * Supported shapes:
+ *
+ *   - `"name"`                       — top-level object field
+ *   - `"user.name"`                  — nested object
+ *   - `"employees[].name"`           — array of objects, one per row
+ *   - `"employees[].partner.name"`   — array of nested objects
+ *   - `"[].name"`                    — TOP-LEVEL array of objects
+ *   - `"[].employee_id[1]"`          — top-level array + many2one label
+ *   - `"emails[]"`                   — array of leaf strings
+ *
+ * Both `path` and `idPath` must walk through the SAME number of `[]`
+ * spreads in the same order so the two leaf lists zip 1:1 — e.g.
+ * `[].employee_id[1]` pairs with `[].employee_id[0]`. Fixed `[N]`
+ * indices do not multiply, so they need not match in count.
+ *
+ * For Odoo many2one fields, use the {@link odooMany2OnePiiField} and
+ * {@link odooSearchReadPiiFields} helpers below instead of spelling
+ * the `[id, label]` index paths out by hand.
  *
  * Type vocabulary
  * ---------------
@@ -84,4 +99,80 @@ export interface ToolPIIField {
   readonly idPath: string;
   /** PII type. Defaults to `PERSON` when omitted. */
   readonly type?: PIIFieldType;
+}
+
+// ---------------------------------------------------------------------------
+// Odoo many2one helpers.
+//
+// Odoo's `search_read` returns a top-level array of records; every
+// many2one field is serialised as a two-element tuple `[id, label]`
+// (an empty relation is `false`, which the walker skips gracefully).
+// Spelling the `[1]` / `[0]` index paths out by hand for every PII
+// field is noisy and error-prone — these helpers centralise the
+// convention so an Odoo tool annotates its result with a one-liner.
+// ---------------------------------------------------------------------------
+
+export interface OdooMany2OneOptions {
+  /** PII type for the many2one label. Defaults to `PERSON`. */
+  readonly type?: PIIFieldType;
+  /**
+   * Object path to the array of Odoo records. Defaults to `''` — the
+   * records ARE the top-level array, which is what `search_read`
+   * returns directly. Pass e.g. `"records"` when the tool wraps the
+   * rows in an envelope: `{ records: [{…}], meta: {…} }`.
+   */
+  readonly recordsAt?: string;
+}
+
+/**
+ * Build a {@link ToolPIIField} for a single Odoo many2one field.
+ *
+ * `odooMany2OnePiiField("employee_id")` →
+ *   `{ path: "[].employee_id[1]", idPath: "[].employee_id[0]" }`
+ *
+ * The label (index 1) is the PII leaf that gets tokenised; the id
+ * (index 0) is the stable identifier. A record whose relation is
+ * empty (`employee_id: false`) contributes no leaf on either path,
+ * so the 1:1 zip stays aligned and the record is simply skipped.
+ */
+export function odooMany2OnePiiField(
+  field: string,
+  options: OdooMany2OneOptions = {},
+): ToolPIIField {
+  const prefix =
+    options.recordsAt !== undefined && options.recordsAt.length > 0
+      ? `${options.recordsAt}[]`
+      : '[]';
+  return {
+    path: `${prefix}.${field}[1]`,
+    idPath: `${prefix}.${field}[0]`,
+    ...(options.type !== undefined ? { type: options.type } : {}),
+  };
+}
+
+/**
+ * Build a {@link ToolPIIField} list for several Odoo many2one fields
+ * at once. The common case for an HR / CRM `search_read` tool:
+ *
+ * ```ts
+ * piiFields: odooSearchReadPiiFields({
+ *   employee_id: 'PERSON',
+ *   user_id: 'PERSON',
+ *   partner_id: 'PERSON',
+ * })
+ * ```
+ *
+ * Pass `{ recordsAt: 'records' }` as the second argument when the
+ * tool wraps the rows in an envelope object.
+ */
+export function odooSearchReadPiiFields(
+  fields: Readonly<Record<string, PIIFieldType>>,
+  options: Pick<OdooMany2OneOptions, 'recordsAt'> = {},
+): ToolPIIField[] {
+  return Object.entries(fields).map(([field, type]) =>
+    odooMany2OnePiiField(field, {
+      type,
+      ...(options.recordsAt !== undefined ? { recordsAt: options.recordsAt } : {}),
+    }),
+  );
 }
