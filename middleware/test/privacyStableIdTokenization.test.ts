@@ -69,29 +69,65 @@ describe('applyStableIdTokenization · slice 1', () => {
     assert.equal(employees[0]?.days, 17);
   });
 
-  it('value-dedup: the same name across rows yields the same token (slice 1)', () => {
-    // Slice 1 uses value-keyed dedup. Two rows referencing the same
-    // employee by the same string get the same token (good for the
-    // typical case). Slice 1.5 will additionally disambiguate
-    // homonyms via idPath.
+  it('keys tokens by entity id: same employee across rows yields one token', () => {
+    // Slice 1.5 — dedup is keyed by the id at `idPath`, not the value.
+    // Two leave bookings by the SAME employee (employee_id 162) get
+    // the SAME token even though their booking ids differ.
     const map = createTokenizeMap();
     const raw = {
       bookings: [
-        { id: 1257, name: 'Marvin Vomberg' },
-        { id: 1085, name: 'Marvin Vomberg' },
-        { id: 1077, name: 'Dennis Zille' },
+        { booking_id: 1257, employee_id: 162, name: 'Marvin Vomberg' },
+        { booking_id: 1085, employee_id: 162, name: 'Marvin Vomberg' },
+        { booking_id: 1077, employee_id: 103, name: 'Dennis Zille' },
       ],
     };
     const result = applyStableIdTokenization(
       raw,
-      [{ path: 'bookings[].name', idPath: 'bookings[].id', type: 'PERSON' }],
+      [
+        {
+          path: 'bookings[].name',
+          idPath: 'bookings[].employee_id',
+          type: 'PERSON',
+        },
+      ],
       map,
     );
     assert.equal(result.replaced, 3);
     const bookings = (result.value as { bookings: Array<Record<string, unknown>> })
       .bookings;
-    assert.equal(bookings[0]?.name, bookings[1]?.name);
-    assert.notEqual(bookings[0]?.name, bookings[2]?.name);
+    assert.equal(bookings[0]?.name, bookings[1]?.name); // same employee id
+    assert.notEqual(bookings[0]?.name, bookings[2]?.name); // different employee
+  });
+
+  it('disambiguates homonyms: same name + different id yields distinct tokens', () => {
+    // The exact failure the slice-1 value-dedup would have caused in a
+    // ranking: two genuinely different employees who share a name.
+    const map = createTokenizeMap();
+    const raw = {
+      employees: [
+        { employee_id: 12, name: 'Thomas Müller' },
+        { employee_id: 88, name: 'Thomas Müller' },
+      ],
+    };
+    const result = applyStableIdTokenization(
+      raw,
+      [
+        {
+          path: 'employees[].name',
+          idPath: 'employees[].employee_id',
+          type: 'PERSON',
+        },
+      ],
+      map,
+    );
+    assert.equal(result.replaced, 2);
+    const employees = (result.value as { employees: Array<Record<string, unknown>> })
+      .employees;
+    // Distinct ids → distinct tokens, even though the name is identical.
+    assert.notEqual(employees[0]?.name, employees[1]?.name);
+    // Both tokens still resolve to the real name.
+    assert.equal(map.resolve(employees[0]?.name as string), 'Thomas Müller');
+    assert.equal(map.resolve(employees[1]?.name as string), 'Thomas Müller');
   });
 
   it('skips leaves that are missing, null, undefined, or non-string', () => {

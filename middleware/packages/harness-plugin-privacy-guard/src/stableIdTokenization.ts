@@ -43,13 +43,12 @@
  * the same nesting order so the two leaf lists zip 1:1. Fixed `[N]`
  * indices do not multiply, so they need not align in count.
  *
- * Slice-1 dedup semantics carry over: the walker uses `tokenFor`'s
- * value-keyed dedup, so the same leaf value within a turn always
- * yields the same token (no row doubling for the same employee name).
- * The `idPath` is consumed for shape-alignment validation but the id
- * value itself is not yet baked into the token name — homonym
- * disambiguation (`"Müller" + id=12` vs `"Müller" + id=88`) lands in
- * slice 1.5.
+ * Dedup semantics (slice 1.5): the walker mints tokens via
+ * `TokenizeMap.tokenForStableId`, keyed by the entity id resolved
+ * from `idPath` — NOT by the string value. The same entity yields one
+ * token across every row of the result; two homonyms that share a
+ * value but differ in id (`"Müller" + id=12` vs `"Müller" + id=88`)
+ * get DISTINCT tokens, so a ranking table never silently merges them.
  *
  * Failure modes
  * -------------
@@ -149,11 +148,16 @@ export function applyStableIdTokenization(
       if (id === null || id === undefined) continue;
       const leaf = readLeaf(addr);
       if (typeof leaf !== 'string' || leaf.length === 0) continue;
-      // Value-keyed dedup: the same string in this turn yields the
-      // same token. The id is validated above (shape-aligned,
-      // non-null) but its concrete value does not yet alter the token
-      // name — slice 1.5 will add homonym disambiguation.
-      const token = map.tokenFor(leaf, typeToDetectorHint(type));
+      // Stable-id dedup (slice 1.5): the token is keyed by the entity
+      // identity at `idPath`, not by the string value. The same
+      // employee yields one token across every row; two homonyms
+      // ("Thomas Müller" id 12 vs id 88) get distinct tokens so a
+      // ranking table never silently merges their rows.
+      const token = map.tokenForStableId(
+        leaf,
+        typeToDetectorHint(type),
+        String(id),
+      );
       writeLeaf(addr, token);
       replaced += 1;
     }

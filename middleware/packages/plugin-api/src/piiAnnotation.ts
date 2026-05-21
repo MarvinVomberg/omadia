@@ -90,11 +90,14 @@ export interface ToolPIIField {
   /** JSON path to the PII-bearing field, e.g. `"employees[].name"`. */
   readonly path: string;
   /**
-   * JSON path to the stable identifier the privacy-guard should use
-   * when minting tokens, e.g. `"employees[].employee_id"`. Must walk
+   * JSON path to the stable identifier the privacy-guard uses as the
+   * token DEDUP KEY, e.g. `"employees[].employee_id"`. Must walk
    * through the same `[]` spreads as `path`. The identifier is
-   * stringified before being embedded in the token name, so numeric
-   * ids (Odoo) and opaque strings (Confluence `accountId`) both work.
+   * stringified, so numeric ids (Odoo) and opaque strings (Confluence
+   * `accountId`) both work. Same id → same token across rows; two
+   * homonyms with different ids → distinct tokens. The id itself is
+   * never embedded in the token name (the token stays `«TYPE_N»` with
+   * a map-local counter), so it never crosses the wire.
    */
   readonly idPath: string;
   /** PII type. Defaults to `PERSON` when omitted. */
