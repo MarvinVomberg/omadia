@@ -23,14 +23,20 @@ git clone https://github.com/byte5ai/omadia.git
 cd omadia
 
 # 1. Provide an Anthropic API key. Other env vars have sane local defaults.
-cp infra/.env.example infra/.env
-$EDITOR infra/.env                                   # set ANTHROPIC_API_KEY=...
+cp middleware/.env.example middleware/.env
+$EDITOR middleware/.env                              # set ANTHROPIC_API_KEY=...
 
 # 2. Bring up the stack (postgres + middleware + admin UI).
-docker compose -f infra/docker-compose.yml --env-file infra/.env up -d
+#    Compose auto-discovers docker-compose.yaml and loads middleware/.env.
+docker compose up -d
 
 # 3. Open the management UI and complete the first-admin wizard.
-open http://localhost:3300                           # /setup walks you through
+open http://localhost:3333                           # /setup walks you through
+
+# 4. (Optional) Enable diagram rendering: generate a secret and add it to
+#    middleware/.env as DIAGRAM_URL_SECRET — only needed alongside
+#    KROKI_BASE_URL + BUCKET_NAME.
+openssl rand -hex 32                                 # paste output into middleware/.env
 ```
 
 The first user-creation flow lands on `/setup`. Once an administrator exists,
@@ -123,15 +129,6 @@ the differentiating logic, and verifying with the smoke runner before install.
   stack and the Fly image are baked from the same `Dockerfile`.
 - **Bring-your-own** — the runtime is a stock Node + Postgres app; any host
   capable of running both works (Kubernetes, ECS, plain VM).
-
-> **Required production secret.** The shipped image runs with
-> `NODE_ENV=production`, which makes `VAULT_KEY` mandatory at boot — without
-> it the middleware refuses to start (this is intentional; the dev fallback
-> writes the master key into the data volume, which is not safe at rest).
-> Generate one with `openssl rand -base64 32` and wire it as a platform
-> secret (Fly: `fly secrets set VAULT_KEY=…`) before the first deploy. The
-> local Compose stack pins `NODE_ENV=development` so the dev fallback stays
-> available for `docker compose up` without configuration.
 
 > **Required production secret.** The shipped image runs with
 > `NODE_ENV=production`, which makes `VAULT_KEY` mandatory at boot — without
