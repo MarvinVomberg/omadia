@@ -125,6 +125,7 @@ type StreamEvent =
       pendingUserChoice?: PendingUserChoice;
       followUpOptions?: FollowUpOption[];
       privacyReceipt?: PrivacyReceipt;
+      maskedValues?: readonly string[];
     }
   | { type: 'error'; message: string };
 
@@ -265,6 +266,11 @@ export default function ChatPage(): React.ReactElement {
             case 'done':
               return {
                 ...m,
+                // The done event carries the authoritative final answer. For
+                // a Privacy Shield v4 turn this is the server-materialized
+                // table — never streamed as deltas — so it must replace the
+                // live preview.
+                content: event.answer,
                 telemetry: {
                   tool_calls: event.toolCalls,
                   iterations: event.iterations,
@@ -287,6 +293,9 @@ export default function ChatPage(): React.ReactElement {
                   : {}),
                 ...(event.privacyReceipt
                   ? { privacyReceipt: event.privacyReceipt }
+                  : {}),
+                ...(event.maskedValues && event.maskedValues.length > 0
+                  ? { maskedValues: event.maskedValues }
                   : {}),
                 finishedAt: Date.now(),
                 streaming: false,
@@ -701,7 +710,10 @@ function MessageRow({
               <NudgeList nudges={message.nudges ?? []} />
             )}
             {message.content.length > 0 ? (
-              <Markdown source={message.content} />
+              <Markdown
+                source={message.content}
+                highlightTerms={message.maskedValues}
+              />
             ) : message.streaming ? (
               <StreamingDots />
             ) : null}
