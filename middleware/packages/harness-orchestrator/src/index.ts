@@ -23,6 +23,70 @@ export type {
   OrchestratorPluginHandle,
 } from './plugin.js';
 
+// Multi-orchestrator registry (US4) — read by US7 channel routing and US9 UI.
+export {
+  OrchestratorRegistry,
+  validateSnapshot,
+} from './registry/index.js';
+export type {
+  ActiveAgent,
+  OrchestratorRegistryOptions,
+  PluginCapabilityLookup,
+} from './registry/index.js';
+// US5 — hot-reload diff + LISTEN/NOTIFY bus.
+export { diffSnapshots, buildForAgent } from './registry/applyDiff.js';
+export type { DiffAction, DiffPlan } from './registry/applyDiff.js';
+export { ReloadBus } from './registry/reloadBus.js';
+export type { ReloadBusOptions } from './registry/reloadBus.js';
+// US7 — channel routing + first-boot onboarding.
+export { ChannelResolver } from './routing/channelResolver.js';
+export type {
+  ChannelResolverOptions,
+  ResolveDecision,
+  ResolveResult,
+} from './routing/channelResolver.js';
+export {
+  ensureFallbackAgent,
+  attachAllPlugins,
+  FALLBACK_AGENT_SLUG,
+} from './registry/onboarding.js';
+export type { OnboardingOptions } from './registry/onboarding.js';
+// US8 — per-Agent memory scope.
+export { computeMemoryScope } from './registry/index.js';
+export {
+  MemoryScopeViolation,
+  ScopedMemoryStore,
+} from './registry/scopedMemoryStore.js';
+export type { ScopedMemoryStoreOptions } from './registry/scopedMemoryStore.js';
+export {
+  ConfigStore,
+  ConfigValidationError,
+} from './registry/configStore.js';
+export type {
+  AgentInput,
+  AgentPatch,
+  AgentPluginInput,
+  AgentPluginRow,
+  AgentRow,
+  AgentStatus,
+  ChannelBindingInput,
+  ChannelBindingRow,
+  ConfigSnapshot,
+  PlatformSettingsRow,
+  PrivacyProfile,
+} from './registry/configStore.js';
+export { runMultiOrchestratorMigrations } from './registry/migrator.js';
+
+// Per-Agent Orchestrator factory (US3) — re-exported so US4-style external
+// callers (CLI, tests) can build Orchestrators without going through the
+// plugin's activate path.
+export { buildOrchestratorForAgent } from './buildOrchestrator.js';
+export type {
+  AgentRuntimeConfig,
+  BuiltOrchestrator,
+  OrchestratorDeps,
+} from './buildOrchestrator.js';
+
 // Orchestrator class + options
 export { Orchestrator, parseToolEmittedChoice } from './orchestrator.js';
 export type { OrchestratorOptions } from './orchestrator.js';
@@ -74,6 +138,7 @@ export type {
   ChatMessage,
   ChatSession,
   ChatSessionSummary,
+  SessionConfigSnapshot,
 } from './chatSessionStore.js';
 
 // Per-turn AsyncLocalStorage context

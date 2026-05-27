@@ -9,6 +9,11 @@ import { createTigrisStore } from '@omadia/diagrams';
 import type { MemoryStore } from '@omadia/plugin-api';
 import { createAdminRouter } from './routes/admin.js';
 import { createChatRouter } from './routes/chat.js';
+import { createOperatorAgentsRouter } from './routes/operatorAgents.js';
+import type {
+  ConfigStore as MultiOrchestratorConfigStore,
+  OrchestratorRegistry as MultiOrchestratorRegistry,
+} from '@omadia/orchestrator';
 import { createMemoryRouter } from './routes/memory.js';
 import { createBulkPromotionRouter } from './routes/bulkPromotion.js';
 import { createInconsistenciesRouter } from './routes/inconsistencies.js';
@@ -391,6 +396,50 @@ async function main(): Promise<void> {
     INSTALLED_REGISTRY_PATH,
   );
   await installedRegistry.load();
+
+  // Phase B (B1) — publish `pluginCapabilities@1` so the orchestrator's
+  // first-boot onboarding (`ensureFallbackAgent`) can hydrate the fallback
+  // Agent with every installed plugin, and so the registry's snapshot
+  // validation has manifest metadata (multi_instance / installed /
+  // memory-scope) to reject impossible configurations.
+  //
+  // Sourced from the freshly-loaded PluginCatalog + InstalledRegistry —
+  // published BEFORE `toolPluginRuntime.activateAllInstalled()` further
+  // down so the orchestrator plugin sees it at consume-time.
+  serviceRegistry.provide('pluginCapabilities', {
+    isMultiInstance(pluginId: string): boolean | undefined {
+      const entry = pluginCatalog.get(pluginId);
+      if (!entry) return undefined;
+      return entry.plugin.multi_instance !== false;
+    },
+    isInstalled(pluginId: string): boolean | undefined {
+      const entry = pluginCatalog.get(pluginId);
+      if (!entry) return undefined;
+      return installedRegistry.has(pluginId);
+    },
+    getMemoryScope(pluginId: string): readonly string[] | undefined {
+      const entry = pluginCatalog.get(pluginId);
+      if (!entry) return undefined;
+      const summary = entry.plugin.permissions_summary;
+      const reads = Array.isArray(summary?.memory_reads)
+        ? summary.memory_reads
+        : [];
+      const writes = Array.isArray(summary?.memory_writes)
+        ? summary.memory_writes
+        : [];
+      return Array.from(new Set([...reads, ...writes]));
+    },
+    listInstalled(): readonly string[] {
+      // Include `active` AND `inactive` plugins (the latter may simply
+      // not have activated yet on this boot). Drop `errored` only —
+      // validateSnapshot would reject those, and the operator should fix
+      // the underlying manifest before the platform re-attaches them.
+      return installedRegistry
+        .list()
+        .filter((entry) => entry.status !== 'errored')
+        .map((entry) => entry.id);
+    },
+  });
 
   // Kernel-wide background-job scheduler. Plugin-contributed jobs (cron or
   // interval) register here via `ctx.jobs.register(...)`. Bulk teardown on
@@ -836,15 +885,26 @@ async function main(): Promise<void> {
   // it inside activate() would flap the plugin into errored-state on every
   // boot. The function itself is plugin-owned (sessionTranscriptParser is
   // bundled with it).
-  try {
-    const backfill = await backfillGraph(memoryStore, knowledgeGraph);
+  //
+  // 2026-05-26: Default-OFF — the 500+ turn replay was the dominant boot
+  // delay (~10 min on prod), and the data it produces is already
+  // persistent in KG from the original turn ingestion. Set
+  // BACKFILL_AT_STARTUP=1 to re-enable for one-off corpus-import boots.
+  if (process.env['BACKFILL_AT_STARTUP'] === '1') {
+    try {
+      const backfill = await backfillGraph(memoryStore, knowledgeGraph);
+      console.log(
+        `[graph] backfill: scopes=${String(backfill.scopes)} files=${String(backfill.files)} turns=${String(backfill.turns)} skipped=${String(backfill.skippedFiles.length)}`,
+      );
+    } catch (err) {
+      console.error(
+        '[graph] backfill failed:',
+        err instanceof Error ? err.message : err,
+      );
+    }
+  } else {
     console.log(
-      `[graph] backfill: scopes=${String(backfill.scopes)} files=${String(backfill.files)} turns=${String(backfill.turns)} skipped=${String(backfill.skippedFiles.length)}`,
-    );
-  } catch (err) {
-    console.error(
-      '[graph] backfill failed:',
-      err instanceof Error ? err.message : err,
+      '[graph] backfill SKIPPED — set BACKFILL_AT_STARTUP=1 to enable (the 500-turn replay was the dominant boot delay; KG already holds the data)',
     );
   }
   // Dynamic agent activation: uploaded packages already marked `active` in
@@ -886,6 +946,46 @@ async function main(): Promise<void> {
   for (const t of domainTools) orchestrator.registerDomainTool(t);
   // Hot-register pathway for future agent installs while the process runs.
   dynamicAgentRuntime.attachOrchestrator(orchestrator);
+
+  // Phase B fix — the multi-orchestrator registry built one Orchestrator per
+  // Agent earlier in boot (inside the orchestrator plugin's activate, during
+  // `toolPluginRuntime.activateAllInstalled`). At that point `domainTools`
+  // was still empty, so every per-Agent orchestrator started with
+  // `domainTools: []` — chat hitting the fallback Agent could not see
+  // `query_odoo_accounting`, `query_confluence`, etc. Push the populated
+  // list into every registry-built Orchestrator now. Skip duplicates so a
+  // hot-installed tool that already self-registered does not throw.
+  const registryForHydrate =
+    serviceRegistry.get<MultiOrchestratorRegistry>('orchestratorRegistry');
+  if (registryForHydrate) {
+    let attached = 0;
+    for (const entry of registryForHydrate.list()) {
+      for (const t of domainTools) {
+        if (!entry.built.orchestrator.hasDomainTool(t.name)) {
+          entry.built.orchestrator.registerDomainTool(t);
+          attached += 1;
+        }
+      }
+    }
+    console.log(
+      `[middleware] registry orchestrators: hydrated with ${String(attached)} domain-tool registrations across ${String(registryForHydrate.list().length)} agent(s)`,
+    );
+    // Persist the wiring so a later `registry.reload()` that REBUILDS an
+    // Agent (privacy_profile flip, etc.) re-hydrates the new orchestrator.
+    // Without this, the rebuilt Agent goes back to `domainTools: []` and
+    // the operator's next chat turn cannot reach the sub-agents.
+    registryForHydrate.setOnAgentBuilt((slug, built) => {
+      for (const t of domainTools) {
+        if (!built.orchestrator.hasDomainTool(t.name)) {
+          built.orchestrator.registerDomainTool(t);
+        }
+      }
+      console.log(
+        `[middleware] registry: orchestrator for "${slug}" hydrated with ${String(domainTools.length)} domain-tool(s)`,
+      );
+    });
+  }
+
   console.log('[middleware] context retriever ready (tail + entity-anchor + FTS)');
 
   // Routines feature (OB-NEW): persistent user-created scheduled agent
@@ -954,12 +1054,42 @@ async function main(): Promise<void> {
   console.log('[middleware] harness admin-ui assets ready at /api/_harness/admin-ui.css');
 
   const agentResolver = createAgentResolver({ dynamicRuntime: dynamicAgentRuntime });
+  // Phase A — Chat router resolves per-Agent via the registry. Falls
+  // back to the legacy default `chatAgent@1` for two cases:
+  //   1. Boot with no registry (no DATABASE_URL) — only the default
+  //      bundle exists, gets reachable via slug "default".
+  //   2. Registry has Agents but the requested slug is "default" —
+  //      same shortcut for back-compat.
+  // Otherwise the slug must map to a registered Agent (registry.get).
+  const registry = serviceRegistry.get<MultiOrchestratorRegistry>('orchestratorRegistry');
+  const resolveChatAgent = (slug: string): ChatAgent | undefined => {
+    const entry = registry?.get(slug);
+    if (entry) return entry.built.bundle.agent;
+    if (slug === 'default') return chatAgent;
+    return undefined;
+  };
+  const getDefaultSlug = (): string | undefined => {
+    const fallback = registry?.slugForFallback();
+    if (fallback) return fallback;
+    // Pre-Phase-A / no-DB boot: the legacy default is the only Agent.
+    return registry ? undefined : 'default';
+  };
   // OB-106: gate the chat-inference endpoints (`POST /api/chat`,
   // `POST /api/chat/stream`) behind `requireAuth`. Without this, anonymous
   // callers could trigger LLM inference (cost) and reach the tool surface
   // (KG-lookups, RAG, Memory-Reads). createChatRouter does not register
   // any public-by-design routes — every route is inference-tied.
-  app.use('/api', requireAuth, createChatRouter(chatAgent, { agentResolver }));
+  app.use(
+    '/api',
+    requireAuth,
+    createChatRouter({
+      agentResolver,
+      resolveChatAgent,
+      getDefaultSlug,
+      chatSessionStore,
+      snapshotForAgent: (slug) => registry?.snapshotForAgent(slug),
+    }),
+  );
 
   // Chat-sessions CRUD behind `requireAuth` — sessions may contain
   // PII / tool outputs / code snippets and must not be readable anonymously.
@@ -1034,6 +1164,28 @@ async function main(): Promise<void> {
     `[middleware] inconsistencies endpoint ready at /api/v1/admin/inconsistencies (detector=${inconsistencyDetectorSvc ? 'on' : 'off'}, bulk=${bulkInconsistencyService ? 'on' : 'off'})`,
   );
 
+  // US9 / T037 — operator-facing Agents dashboard backend. Mounts at
+  // /api/v1/operator/agents/*. 503s when the orchestratorRegistry@1
+  // service is not published (no DATABASE_URL / orchestrator plugin not
+  // active). Writes route through ConfigStore → trigger → reload bus →
+  // registry.reload(), so the next request already sees the new config.
+  app.use(
+    '/api/v1/operator/agents',
+    requireAuth,
+    createOperatorAgentsRouter({
+      getConfigStore: () =>
+        serviceRegistry.get<MultiOrchestratorConfigStore>('configStore'),
+      getRegistry: () =>
+        serviceRegistry.get<MultiOrchestratorRegistry>('orchestratorRegistry'),
+      getChatSessionStore: () => chatSessionStore,
+      getPluginCatalog: () => pluginCatalog,
+      getInstalledRegistry: () => installedRegistry,
+    }),
+  );
+  console.log(
+    '[middleware] operator-agents endpoints ready at /api/v1/operator/agents/* (auth-gated)',
+  );
+
   // Slice 10 — near-duplicate MK workflow. Mirrors the Slice 9
   // mounting pattern: detector + bulk are optional, route 503s when
   // missing. `requireAuth` gates the router, consistent with the
@@ -1080,6 +1232,7 @@ async function main(): Promise<void> {
       '[middleware] topics endpoint skipped — topicClustering service not published',
     );
   }
+
 
   // ── OB-49 — provider-aware auth bootstrap ────────────────────────────────
   // graphPool is resolved above (line ~595). Auth schema + UserStore +

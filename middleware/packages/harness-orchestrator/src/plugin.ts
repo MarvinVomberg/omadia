@@ -1,5 +1,4 @@
 import Anthropic from '@anthropic-ai/sdk';
-import type { Pool } from 'pg';
 import type { ChatAgent } from '@omadia/channel-sdk';
 import type { EmbeddingClient } from '@omadia/embeddings';
 // Phase 5B: structural shim — `@omadia/integration-microsoft365` lives
@@ -37,15 +36,25 @@ import {
 } from '@omadia/plugin-api';
 import type { VerifierBundle } from '@omadia/verifier';
 
-import { ChatSessionStore } from './chatSessionStore.js';
+import type { Pool } from 'pg';
+
+import {
+  buildOrchestratorForAgent,
+  type OrchestratorDeps,
+} from './buildOrchestrator.js';
+import type { ChatSessionStore } from './chatSessionStore.js';
 import type { NativeToolRegistry } from './nativeToolRegistry.js';
-import { Orchestrator } from './orchestrator.js';
-import { SessionLogger } from './sessionLogger.js';
-import { AskUserChoiceTool } from './tools/askUserChoiceTool.js';
-import { BookMeetingTool } from './tools/bookMeetingTool.js';
-import { ChatParticipantsTool } from './tools/chatParticipantsTool.js';
-import { FindFreeSlotsTool } from './tools/findFreeSlotsTool.js';
-import { SuggestFollowUpsTool } from './tools/suggestFollowUpsTool.js';
+import type { Orchestrator } from './orchestrator.js';
+import { ConfigStore } from './registry/configStore.js';
+import {
+  OrchestratorRegistry,
+  type PluginCapabilityLookup,
+} from './registry/index.js';
+import { runMultiOrchestratorMigrations } from './registry/migrator.js';
+import { ensureFallbackAgent } from './registry/onboarding.js';
+import { ReloadBus } from './registry/reloadBus.js';
+import { ChannelResolver } from './routing/channelResolver.js';
+import type { SessionLogger } from './sessionLogger.js';
 import {
   EDIT_PROCESS_TOOL_NAME,
   PROCESS_MEMORY_SYSTEM_PROMPT_DOC,
@@ -61,8 +70,6 @@ import {
   runStoredProcessToolSpec,
   writeProcessToolSpec,
 } from './tools/processMemoryTool.js';
-import { VerifierService } from './verifierService.js';
-
 /**
  * @omadia/orchestrator — plugin entry point.
  *
@@ -116,6 +123,11 @@ import { VerifierService } from './verifierService.js';
 
 const CHAT_AGENT_SERVICE = 'chatAgent';
 const NATIVE_TOOL_REGISTRY_SERVICE = 'nativeToolRegistry';
+const ORCHESTRATOR_REGISTRY_SERVICE = 'orchestratorRegistry';
+const CHANNEL_RESOLVER_SERVICE = 'channelResolver';
+const CONFIG_STORE_SERVICE = 'configStore';
+const GRAPH_POOL_SERVICE = 'graphPool';
+const PLUGIN_CAPABILITIES_SERVICE = 'pluginCapabilities';
 
 // Fallback when the operator has not set `orchestrator_model` in the install
 // config. Must be a currently-served Anthropic model id — a stale/typo'd id
@@ -316,44 +328,19 @@ export async function activate(
     process.env['KG_ACL_AUTO_PROMOTE_THRESHOLD'],
     0.7,
   );
-  const graphPool = ctx.services.get<Pool>('graphPool');
+  const graphPool = ctx.services.get<Pool>(GRAPH_POOL_SERVICE);
   const graphTenantId =
     process.env['GRAPH_TENANT_ID'] ??
     ctx.config.get<string>('graph_tenant_id') ??
     'default';
 
-  // Anthropic client + storage layer.
+  // Anthropic client — shared across every Agent built from this plugin.
   //
   // maxRetries: the Anthropic SDK auto-retries 408/409/429/500/529 with
   // exponential backoff. The SDK default is 2; bumped to 5 so a transient
   // `overloaded_error` (HTTP 529) burst is far more likely to ride out
-  // inside the SDK instead of surfacing as a failed turn.
+  // inside the SDK instead of surfacing as a failed turn. (Merged from main.)
   const client = new Anthropic({ apiKey, maxRetries: 5 });
-  const chatSessionStore = new ChatSessionStore(memoryStore);
-  const sessionLogger = new SessionLogger(
-    memoryStore,
-    knowledgeGraph,
-    chatSessionStore,
-  );
-
-  // Native-tool instances (channel-coupled UI cards + calendar)
-  const chatParticipantsTool = new ChatParticipantsTool();
-  const askUserChoiceTool = new AskUserChoiceTool();
-  const suggestFollowUpsTool = new SuggestFollowUpsTool();
-  const findFreeSlotsTool = microsoft365
-    ? new FindFreeSlotsTool(
-        microsoft365.obo,
-        microsoft365.calendar,
-        microsoft365.slots,
-      )
-    : undefined;
-  const bookMeetingTool = microsoft365
-    ? new BookMeetingTool(
-        microsoft365.obo,
-        microsoft365.calendar,
-        microsoft365.slots,
-      )
-    : undefined;
 
   // OB-77 (Palaia Phase 8) — Nudge-Pipeline. Publish a fresh in-memory
   // registry, then drain `nudgeProviders@1` (side-channel for plugins
@@ -384,42 +371,12 @@ export async function activate(
     `[harness-orchestrator] nudgeRegistry@1 published (stateStore=${nudgeStateStore ? 'on' : 'off'}, queuedProviders=${String(queuedNudgeProviders.length)})`,
   );
 
-  // Orchestrator construction. domainTools is intentionally empty here —
-  // sub-agents (kernel-built calendar/accounting/hr/confluence + uploaded
-  // agents from dynamicAgentRuntime) self-register via the kernel's
-  // `dynamicAgentRuntime.attachOrchestrator(bundle.raw)` post-activate
-  // callout, mirroring today's hot-register flow.
-  const orchestrator = new Orchestrator({
-    client,
-    model,
-    maxTokens,
-    maxToolIterations: maxIterations,
-    domainTools: [],
-    nativeToolRegistry,
-    sessionLogger,
-    entityRefBus,
-    knowledgeGraph,
-    ...(contextRetriever ? { contextRetriever } : {}),
-    ...(sessionBriefing ? { sessionBriefing } : {}),
-    ...(factExtractor ? { factExtractor } : {}),
-    ...(excerptExtractor ? { excerptExtractor } : {}),
-    autoPromote,
-    autoPromoteThreshold,
-    ...(graphPool ? { graphPool } : {}),
-    graphTenantId,
-    ...(assistantIdentity ? { assistantIdentity } : {}),
-    chatParticipantsTool,
-    askUserChoiceTool,
-    suggestFollowUpsTool,
-    ...(findFreeSlotsTool ? { findFreeSlotsTool } : {}),
-    ...(bookMeetingTool ? { bookMeetingTool } : {}),
-    ...(embeddingClient ? { embeddingClient } : {}),
-    responseGuard: responseGuardGetter,
-    privacyGuard: privacyGuardGetter,
-    nudgeRegistry,
-    ...(nudgeStateStore ? { nudgeStateStore } : {}),
-    ...(processMemory ? { nudgeProcessMemory: processMemory } : {}),
-  });
+  // US3 — Orchestrator construction is the per-Agent factory
+  // `buildOrchestratorForAgent`; invoked below, after the process-wide
+  // ProcessMemory tool registration. main's main-line `new Orchestrator()`
+  // call was replaced by the factory in US3; its new fields (autoPromote /
+  // autoPromoteThreshold / graphPool / graphTenantId / excerptExtractor /
+  // assistantIdentity) flow through via `OrchestratorDeps`.
 
   // OB-76: attach 4 ProcessMemory native tools via the nativeToolRegistry.
   // Full registration (handler + spec + promptDoc) — the
@@ -462,31 +419,142 @@ export async function activate(
     );
   }
 
-  // Verifier wrapper — only when the verifier@1 capability is published.
-  // Without it, the bare Orchestrator IS the chatAgent (it implements the
-  // duck-typed ChatAgent contract via chat() + chatStream()).
-  let agent: ChatAgent = orchestrator;
-  if (verifierBundle) {
-    agent = new VerifierService({
-      orchestrator,
-      pipeline: verifierBundle.pipeline,
-      ...(verifierBundle.store ? { store: verifierBundle.store } : {}),
-      enabled: true,
-      mode: verifierBundle.mode,
-      maxRetries: verifierBundle.maxRetries,
-    });
+  // US3 — per-Agent Orchestrator construction. The orchestrator plugin
+  // builds the single "default" Agent; the multi-orchestrator registry
+  // (US4) calls the same factory once per configured Agent against the
+  // same `deps`.
+  const orchestratorDeps: OrchestratorDeps = {
+    client,
+    knowledgeGraph,
+    memoryStore,
+    entityRefBus,
+    nativeToolRegistry,
+    nudgeRegistry,
+    responseGuard: responseGuardGetter,
+    privacyGuard: privacyGuardGetter,
+    ...(contextRetriever ? { contextRetriever } : {}),
+    ...(sessionBriefing ? { sessionBriefing } : {}),
+    ...(factExtractor ? { factExtractor } : {}),
+    ...(excerptExtractor ? { excerptExtractor } : {}),
+    ...(embeddingClient ? { embeddingClient } : {}),
+    ...(microsoft365 ? { microsoft365 } : {}),
+    ...(verifierBundle ? { verifierBundle } : {}),
+    ...(nudgeStateStore ? { nudgeStateStore } : {}),
+    ...(processMemory ? { processMemory } : {}),
+    autoPromote,
+    autoPromoteThreshold,
+    ...(graphPool ? { graphPool } : {}),
+    graphTenantId,
+    ...(assistantIdentity ? { assistantIdentity } : {}),
+  };
+  const built = buildOrchestratorForAgent(
+    {
+      agentId: 'default',
+      model,
+      maxTokens,
+      maxToolIterations: maxIterations,
+    },
+    orchestratorDeps,
+  );
+  ctx.services.provide(CHAT_AGENT_SERVICE, built.bundle);
+
+  // US4 — multi-orchestrator registry. Optional: only when a Postgres pool
+  // is available (test/in-memory boots skip it). The registry runs its own
+  // migration, loads the config snapshot, and publishes itself as
+  // `orchestratorRegistry@1` for US7 (channel routing) and US9 (operator UI).
+  // The legacy `chatAgent@1` keeps serving the default boot path — the
+  // registry sits alongside it. `graphPool` is already late-resolved at
+  // the top of activate() (merged from main 2026-05-26).
+  let registry: OrchestratorRegistry | undefined;
+  let reloadBus: ReloadBus | undefined;
+  if (graphPool) {
+    try {
+      await runMultiOrchestratorMigrations(graphPool, (m) =>
+        ctx.log(`[harness-orchestrator] ${m}`),
+      );
+      const pluginLookup = ctx.services.get<PluginCapabilityLookup>(
+        PLUGIN_CAPABILITIES_SERVICE,
+      );
+      const store = new ConfigStore(graphPool);
+      // US9 / T037 — publish the configStore so the operator REST router
+      // can perform writes without re-instantiating its own store
+      // (singleton; cheaper than reconnecting, and write events flow
+      // through the same trigger → reload-bus pipeline).
+      ctx.services.provide(CONFIG_STORE_SERVICE, store);
+
+      // US7 / T029 — first-boot fallback Agent seed. Runs before the
+      // registry's `start()` so the very first boot already has a fallback
+      // available for unbound channel keys.
+      //
+      // Phase B (B1) — when the kernel publishes `pluginCapabilities@1`
+      // with `listInstalled()`, the fallback Agent is hydrated with every
+      // installed plugin on first creation. Without the lookup (older
+      // kernel boot, tests) it falls back to the legacy zero-plugin seed.
+      const installedPluginIds = pluginLookup?.listInstalled?.();
+      await ensureFallbackAgent(store, {
+        log: (msg, fields) =>
+          ctx.log(
+            `[harness-orchestrator] ${msg}${fields ? ' ' + JSON.stringify(fields) : ''}`,
+          ),
+        ...(installedPluginIds
+          ? { pluginIds: [...installedPluginIds] }
+          : {}),
+      });
+
+      registry = new OrchestratorRegistry(store, orchestratorDeps, {
+        defaultRuntimeConfig: {
+          model,
+          maxTokens,
+          maxToolIterations: maxIterations,
+        },
+        ...(pluginLookup ? { pluginLookup } : {}),
+        log: (msg, fields) =>
+          ctx.log(
+            `[harness-orchestrator] ${msg}${fields ? ' ' + JSON.stringify(fields) : ''}`,
+          ),
+      });
+      await registry.start();
+      ctx.services.provide(ORCHESTRATOR_REGISTRY_SERVICE, registry);
+      ctx.log(
+        `[harness-orchestrator] orchestratorRegistry@1 published (agents=${String(registry.size())})`,
+      );
+
+      // US7 / T028 — publish the channel resolver so channel plugins can
+      // route inbound webhooks per-binding. Opt-in: the legacy
+      // `chatAgent@1` keeps serving anything that does not consume it.
+      const resolver = new ChannelResolver({
+        registry,
+        log: (msg, fields) =>
+          ctx.log(
+            `[harness-orchestrator] ${msg}${fields ? ' ' + JSON.stringify(fields) : ''}`,
+          ),
+      });
+      ctx.services.provide(CHANNEL_RESOLVER_SERVICE, resolver);
+      ctx.log('[harness-orchestrator] channelResolver@1 published');
+
+      // US5 / T021 — LISTEN/NOTIFY hot-reload bus. Bound to the same pool
+      // so the bus reserves one connection from the kg pool for the LISTEN
+      // lifetime; no second connection string needed. Periodic reconcile
+      // is the fallback for a dropped LISTEN connection (D3).
+      reloadBus = new ReloadBus({
+        pool: graphPool,
+        reload: () => registry!.reload(),
+        log: (msg, fields) =>
+          ctx.log(
+            `[harness-orchestrator] ${msg}${fields ? ' ' + JSON.stringify(fields) : ''}`,
+          ),
+      });
+      await reloadBus.start();
+    } catch (err) {
+      ctx.log(
+        `[harness-orchestrator] orchestratorRegistry NOT published — ${(err as Error).message}`,
+      );
+    }
+  } else {
     ctx.log(
-      `[harness-orchestrator] verifier wrapper enabled (mode=${verifierBundle.mode}, store=${verifierBundle.store ? 'on' : 'off'}, maxRetries=${String(verifierBundle.maxRetries)})`,
+      '[harness-orchestrator] orchestratorRegistry SKIPPED — no graphPool (set DATABASE_URL to enable multi-orchestrator runtime)',
     );
   }
-
-  const bundle: ChatAgentBundle = {
-    agent,
-    raw: orchestrator,
-    sessionLogger,
-    chatSessionStore,
-  };
-  ctx.services.provide(CHAT_AGENT_SERVICE, bundle);
 
   ctx.log(
     `[harness-orchestrator] chatAgent@1 published (model=${model}, maxTokens=${String(maxTokens)}, maxIter=${String(maxIterations)}, verifier=${verifierBundle ? 'on' : 'off'}, calendar=${microsoft365 ? 'on' : 'off'}, contextRetriever=${contextRetriever ? 'on' : 'off'}, factExtractor=${factExtractor ? 'on' : 'off'}, palaiaExcerpt=${excerptExtractor ? 'on' : 'off'}, autoPromote=${autoPromote ? `on@${autoPromoteThreshold.toFixed(2)}` : 'off'}, embeddingClient=${embeddingClient ? 'on' : 'off'}, responseGuard=late-bound)`,
@@ -495,6 +563,13 @@ export async function activate(
   return {
     async close(): Promise<void> {
       ctx.log('[harness-orchestrator] deactivating');
+      if (reloadBus) {
+        try {
+          await reloadBus.stop();
+        } catch {
+          // best-effort
+        }
+      }
       try {
         disposeNudgeRegistry();
       } catch {
