@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 
-import type { PluginContext } from '@omadia/plugin-api';
+import {
+  PRIVACY_REDACT_SERVICE_NAME,
+  type PluginContext,
+  type PrivacyGuardService,
+  type PrivacyResolvedDataset,
+} from '@omadia/plugin-api';
 import {
   CHAT_AGENT_SERVICE,
   type ChatAgent,
@@ -9,6 +14,7 @@ import {
   type ChatTurnInput,
   type RevisionId,
 } from '@omadia/channel-sdk';
+import { turnContext } from '@omadia/orchestrator';
 
 import { composeSkeleton, type CompositionLlm, type DataRequirement } from './composition.js';
 import { mintDataRef } from './dataRef.js';
@@ -77,30 +83,97 @@ export interface UiOrchestratorPluginHandle {
  *  skeleton as a deterministic `surface_patch`. Always in the allow-set. */
 export const CANVAS_PUBLISH_TOOL = 'canvas_publish_rows';
 
+/** Resolves a privacy-shield datasetId to its real rows within the current
+ *  turn. Returns `'unavailable'` when no privacy provider with dataset
+ *  support is active (or no turn context exists), `undefined` for an
+ *  unknown/expired id. Mirrors the office plugin's adapter pattern. */
+export type CanvasDatasetResolver = (
+  datasetId: string,
+) => PrivacyResolvedDataset | 'unavailable' | undefined;
+
+/** Privacy Shield v4: a dataset reference the LLM mistakenly wrapped INTO the
+ *  rows array instead of passing `datasetId` top-level. Detecting it turns a
+ *  silent one-garbage-row publish into a self-correcting tool error. */
+const looksLikeDatasetRef = (rows: ReadonlyArray<Record<string, unknown>>): boolean =>
+  rows.length === 1 &&
+  rows[0] !== undefined &&
+  Object.keys(rows[0]).length === 1 &&
+  (typeof rows[0]['datasetId'] === 'string' ||
+    Object.values(rows[0]).some((v) => typeof v === 'string' && /^ds_[0-9a-f-]{8,}$/i.test(v)));
+
+/** Hard cap for dataset publishes — the canvas viewState budget is finite;
+ *  bigger sets belong in a file (create_xlsx) or a filtered view. */
+const MAX_DATASET_PUBLISH_ROWS = 500;
+
 /** NativeToolHandler for {@link CANVAS_PUBLISH_TOOL}. Exported for tests.
  *  Accepts EITHER `rows` (tabular → table/chart) OR `fields` (a flat scalar
- *  object → a KPI/score container). An EMPTY rows array is legitimate (the data
- *  set is genuinely empty) — the sentinel still resolves the skeleton's loading
- *  state client-side. */
-export async function handleCanvasPublishRows(input: unknown): Promise<string> {
+ *  object → a KPI/score container) OR `datasetId` (a privacy-shield dataset
+ *  interned THIS turn — the real rows are resolved SERVER-SIDE and never pass
+ *  through the LLM; the canvas patch is user-destined egress of the same
+ *  trust class as a rendered answer or a generated file). An EMPTY rows array
+ *  is legitimate (the data set is genuinely empty) — the sentinel still
+ *  resolves the skeleton's loading state client-side. */
+export async function handleCanvasPublishRows(
+  input: unknown,
+  resolveDataset?: CanvasDatasetResolver,
+): Promise<string> {
   const args = (typeof input === 'object' && input !== null ? input : {}) as Record<string, unknown>;
   const containerId = typeof args['containerId'] === 'string' ? args['containerId'].trim() : '';
   const hasRows = Array.isArray(args['rows']);
   const fieldsRaw = args['fields'];
   const hasFields =
     typeof fieldsRaw === 'object' && fieldsRaw !== null && !Array.isArray(fieldsRaw);
-  if (containerId.length === 0 || (!hasRows && !hasFields)) {
+  const datasetId =
+    typeof args['datasetId'] === 'string' && args['datasetId'].trim().length > 0
+      ? args['datasetId'].trim()
+      : undefined;
+  if (containerId.length === 0 || (!hasRows && !hasFields && datasetId === undefined)) {
     return (
       'Error: canvas_publish_rows requires a containerId and EITHER a rows array of objects ' +
       '(tabular data → table/chart; may be empty for an empty data set) OR a fields object ' +
-      '{ fieldKey: value } of named scalar values (KPI/score container).'
+      '{ fieldKey: value } of named scalar values (KPI/score container) OR a datasetId ' +
+      '(privacy-shield dataset from THIS turn — rows resolve server-side).'
     );
   }
-  const rows = hasRows
+  if (datasetId !== undefined && (hasRows || hasFields)) {
+    return (
+      'Error: canvas_publish_rows takes EITHER datasetId OR rows/fields — not both. ' +
+      'For shielded data pass ONLY the datasetId (shape it first with v4_select/v4_sort if needed).'
+    );
+  }
+  let rows = hasRows
     ? (args['rows'] as unknown[]).filter(
         (r): r is Record<string, unknown> => typeof r === 'object' && r !== null && !Array.isArray(r),
       )
     : [];
+  if (datasetId === undefined && hasRows && looksLikeDatasetRef(rows)) {
+    return (
+      'Error: that rows array contains a dataset REFERENCE, not data. Pass the id as the ' +
+      'top-level `datasetId` parameter instead — the server resolves the real (masked) rows ' +
+      'into the canvas. Do NOT retype masked values as rows.'
+    );
+  }
+  let truncatedFrom: number | undefined;
+  if (datasetId !== undefined) {
+    const resolved = resolveDataset === undefined ? 'unavailable' : resolveDataset(datasetId);
+    if (resolved === 'unavailable') {
+      return (
+        'Error: dataset publishing is unavailable on this server (no privacy provider with ' +
+        'dataset support active). Publish concrete rows instead.'
+      );
+    }
+    if (resolved === undefined) {
+      return (
+        `Error: unknown or expired datasetId "${datasetId}". Dataset ids are only valid within ` +
+        'the turn that interned them — re-run the data tool and publish in the SAME turn.'
+      );
+    }
+    rows = resolved.rows.map((r) => ({ ...r }));
+    if (rows.length > MAX_DATASET_PUBLISH_ROWS) {
+      truncatedFrom = rows.length;
+      rows = rows.slice(0, MAX_DATASET_PUBLISH_ROWS);
+    }
+  }
   // Scalar/KPI payload: keep only scalar values (strings/numbers/booleans).
   const fields = hasFields
     ? Object.fromEntries(
@@ -134,7 +207,12 @@ export async function handleCanvasPublishRows(input: unknown): Promise<string> {
         ? `Published ${Object.keys(fields as object).length} field(s) for ${containerId}.`
         : rows.length === 0
           ? `No rows for ${containerId} — the data set is empty.`
-          : `Published ${rows.length} row(s) for ${containerId}.`;
+          : datasetId !== undefined
+            ? `Published ${rows.length} row(s) from dataset ${datasetId} for ${containerId}.` +
+              (truncatedFrom !== undefined
+                ? ` Truncated from ${truncatedFrom} rows — use a file export for the full set.`
+                : '')
+            : `Published ${rows.length} row(s) for ${containerId}.`;
   const chartType =
     args['chartType'] === 'bar' || args['chartType'] === 'line' || args['chartType'] === 'pie'
       ? args['chartType']
@@ -275,14 +353,19 @@ export async function activate(
       description:
         'Publish fetched data for an Omadia UI canvas container. Use ONLY when the user ' +
         'message carries a [canvas-context] block: call it for each containerId from its ' +
-        'dataRequirements. TWO shapes — pick by the container the dataRequirement describes: ' +
+        'dataRequirements. THREE shapes — pick by what you hold: ' +
         '(1) TABULAR containers (a row per record) → pass `rows` keyed EXACTLY by the promised ' +
         'fieldKeys; large sets go out in batches of at most 30 rows per call (repeated calls ' +
         'for the same containerId APPEND — one call at a time until every row is out; a single ' +
         'oversized call risks being truncated and dropped). (2) SCALAR/KPI containers (named ' +
         'single values, e.g. a score block) → pass `fields` as a { fieldKey: value } object ' +
-        'instead of rows. The data renders directly into the already-visible canvas — do not ' +
-        'repeat it as text afterwards.',
+        'instead of rows. (3) PRIVACY-SHIELD datasets (a tool returned a datasetId and you only ' +
+        'see masked values) → pass `datasetId` INSTEAD of rows; the server resolves the real ' +
+        'rows into the canvas (shape them first with v4_select/v4_sort — the column paths ' +
+        'become the fieldKeys). NEVER retype masked rows and never wrap the id into `rows`. ' +
+        'The data renders directly into the already-visible canvas — do not repeat it as text ' +
+        'afterwards. If the tool returns an Error result, do NOT claim success — say briefly ' +
+        'what failed.',
       input_schema: {
         type: 'object',
         properties: {
@@ -309,6 +392,14 @@ export async function activate(
               'values (e.g. a score block: { "seo": 82, "mobile": 90 }). Keys = the promised ' +
               'fieldKeys; values are plain scalars (string/number/boolean). Use INSTEAD of ' +
               '`rows` — never both. The values fill the container’s cards in place.',
+          },
+          datasetId: {
+            type: 'string',
+            description:
+              'PRIVACY-SHIELD datasets ONLY: the dataset id (ds_…) a tool returned THIS turn. ' +
+              'Use INSTEAD of rows/fields — the server resolves the real (unmasked) rows into ' +
+              'the canvas; you never see them. Shape the dataset first with v4_select/v4_sort ' +
+              'so its column paths match the promised fieldKeys.',
           },
           prose: {
             type: 'string',
@@ -371,7 +462,21 @@ export async function activate(
         required: ['containerId'],
       },
     },
-    handleCanvasPublishRows,
+    // Privacy Shield v4: datasetId publishes resolve the real rows server-side
+    // within the current turn. The provider is resolved LAZILY per call (same
+    // reasoning as the office plugin): activation order is not guaranteed, and
+    // narrow test contexts have no services accessor at all.
+    (input) =>
+      handleCanvasPublishRows(input, (datasetId) => {
+        const turnId = turnContext.current()?.turnId;
+        const privacy = (
+          ctx.services as PluginContext['services'] | undefined
+        )?.get<PrivacyGuardService>(PRIVACY_REDACT_SERVICE_NAME);
+        if (turnId === undefined || privacy?.resolveDatasetForRender === undefined) {
+          return 'unavailable';
+        }
+        return privacy.resolveDatasetForRender(turnId, datasetId);
+      }),
   );
   const disposeChoiceTool: (() => void) | undefined = toolsAccessor?.register(
     {
@@ -746,6 +851,11 @@ export async function activate(
             'values, e.g. a score block — its fields are individual metrics, ' +
             'not table columns) is filled by passing `fields` ({ fieldKey: ' +
             'value }) INSTEAD of rows. ' +
+            'PRIVACY-SHIELD RULE: when a tool returned a datasetId and you ' +
+            'only see masked values, pass that `datasetId` to ' +
+            'canvas_publish_rows INSTEAD of rows (shape it first with ' +
+            'v4_select/v4_sort so the column paths match the fieldKeys) — ' +
+            'the server resolves the real rows; never retype masked data. ' +
             'BATCH RULE: at most 30 rows per call — for larger sets publish ' +
             'batch after batch to the same containerId (calls append), one ' +
             'call at a time, until every row is out; NEVER pack the whole set ' +
@@ -894,7 +1004,8 @@ export async function activate(
         'newer data, nothing else. Work silently: no narration, no memory ' +
         'commentary. Publish via canvas_publish_rows per containerId with ' +
         'rows keyed EXACTLY by the listed fieldKeys (batches of at most 30 ' +
-        'rows, one call at a time); the canvas REPLACES the stale rows. On ' +
+        'rows, one call at a time; for a privacy-shield datasetId pass ' +
+        '`datasetId` instead of rows); the canvas REPLACES the stale rows. On ' +
         'the FIRST publish per container pass `source` (exact tool + input + ' +
         'fieldKey→attribute map, relative date operators for relative ' +
         'periods) so the NEXT refresh runs without you. Do NOT compose a ' +
