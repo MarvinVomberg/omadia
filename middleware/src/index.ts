@@ -178,6 +178,8 @@ import { installProcessGuards } from './platform/processGuards.js';
 import { PluginRouteRegistry } from './platform/pluginRouteRegistry.js';
 import { NotificationRouter } from './platform/notificationRouter.js';
 import { UiRouteCatalog } from './platform/uiRouteCatalog.js';
+import { CanvasOutputRegistry } from './platform/canvasOutputRegistry.js';
+import { DeterministicActionRegistry } from './platform/deterministicActionRegistry.js';
 import { ServiceRegistry } from './platform/serviceRegistry.js';
 import { TurnHookRegistry } from './platform/turnHookRegistry.js';
 import { NativeToolRegistry } from '@omadia/orchestrator';
@@ -266,6 +268,20 @@ async function main(): Promise<void> {
   // plugin would miss those registrations.
   const nativeToolRegistry = new NativeToolRegistry();
   serviceRegistry.provide('nativeToolRegistry', nativeToolRegistry);
+  // Canvas-output autodiscovery (declare → resolve → derive): plugins declare
+  // `canvas_output: true` per manifest capability, the agent runtime resolves
+  // those into this registry on (de)activation, and the ui-orchestrator
+  // derives its sentinel allow-set from it lazily — no re-activation needed
+  // when a new plugin is installed. The orchestrator's `canvas_output_tools`
+  // config field remains as an operator override on top.
+  const canvasOutputRegistry = new CanvasOutputRegistry();
+  serviceRegistry.provide('canvasOutputRegistry', canvasOutputRegistry);
+  // Deterministic-action autodiscovery (sibling of canvas-output): tools
+  // declaring `deterministic_action: true` resolve into this registry on
+  // (de)activation; the ui-orchestrator derives its LLM-free dispatch set from
+  // it lazily. The `deterministic_action_tools` config field stays as override.
+  const deterministicActionRegistry = new DeterministicActionRegistry();
+  serviceRegistry.provide('deterministicActionRegistry', deterministicActionRegistry);
   // #133 E0 — expose the kernel turn-hook registry to the orchestrator plugin
   // so it can fire onBeforeTurn / onAfterToolCall / onAfterTurn during turns.
   serviceRegistry.provide('turnHookRegistry', turnHookRegistry);
@@ -556,7 +572,24 @@ async function main(): Promise<void> {
     notificationRouter,
     uiRouteCatalog,
     jobScheduler,
+    canvasOutputRegistry,
+    deterministicActionRegistry,
     log: (...a) => console.log(...a),
+  });
+  // agentToolInvoker — the kernel half of the deterministic-action fast-path.
+  // Lets the ui-orchestrator run ONE agent-plugin tool by id directly (no
+  // sub-agent model loop) when a canvas action names a deterministic tool.
+  // Also exposes the optional streaming variant (`hasStream` + `invokeStream`)
+  // for tools whose raw UploadedToolkit entry carries `runStream()`. This
+  // deliberately does NOT add these tools to the main orchestrator's offered-
+  // tool list, so agent isolation is preserved.
+  serviceRegistry.provide('agentToolInvoker', {
+    invoke: (toolId: string, input: unknown): Promise<string | undefined> =>
+      dynamicAgentRuntime.invokeAgentTool(toolId, input),
+    hasStream: (toolId: string): boolean =>
+      dynamicAgentRuntime.hasStreamingTool(toolId),
+    invokeStream: (toolId: string, input: unknown): AsyncGenerator<string> =>
+      dynamicAgentRuntime.invokeAgentToolStream(toolId, input),
   });
 
   // Runtime for `kind: tool` / `kind: extension` plugins. These don't expose

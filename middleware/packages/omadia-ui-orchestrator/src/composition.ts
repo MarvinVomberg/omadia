@@ -43,12 +43,80 @@ export const FALLBACK_SKELETON = {
 
 const SYSTEM_PROMPT = `You are the Omadia UI Tier-2 composer. Given a user request, emit ONLY a JSON object:
 { "tree": <primitive tree>, "dataRequirements": [{ "containerId", "description", "dataClass"?, "fields": [{ "fieldKey", "label", "type"? }] }] }
-The tree is a SKELETON for data still being fetched: data-carrying primitives use loading:"skeleton" and empty rows/items. Use only these primitives: container, heading, text, table, list, tree, button, input, choice, toggle, image, chart, form, toolbar, menubar, tabs, pane, status, progress, divider. Every container and data-carrying primitive needs a stable "id"; table columns need fieldKey+label. dataRequirements must name, per data-carrying container, exactly the fields the content agents must deliver. No prose, no markdown fences — raw JSON only.`;
+
+The tree is a SKELETON for data still being fetched: data-carrying primitives set "loading":"skeleton" with EMPTY rows/items/points ([]). The fetched data is patched in later.
+
+PRIMITIVE SHAPES — emit EXACTLY these keys, no others (extra keys are rejected). Every node MAY carry "id" (stable string) and "loading":"none"|"skeleton"|"spinner".
+- container: { "type":"container", "id", "layout":"stack"|"split"|"grid"|"flow", "children":[ ...primitives ], "title"?:string }
+- heading:   { "type":"heading", "content":string, "level"?:1..6 }
+- text:      { "type":"text", "content":string }
+- status:    { "type":"status", "text":string }
+- divider:   { "type":"divider" }
+- table:     { "type":"table", "id", "loading":"skeleton", "columns":[ { "fieldKey":string, "label":string, "type"?:string } ], "rows":[] }
+- list:      { "type":"list", "id", "loading":"skeleton", "items":[] }
+- chart:     { "type":"chart", "id", "loading":"skeleton", "chartType":"bar"|"line"|"pie", "points":[] }
+- tabs:      { "type":"tabs", "id", "tabs":[ { "label":string, "child": <ONE primitive> } ] }
+- pane:      { "type":"pane", "id", "title"?:string, "container"?: <ONE primitive>, "children"?:[ ...primitives ] }
+- button:    { "type":"button", "id", "label":string, "action"?:{ "type":string, "payload"?:object } }
+- choice:    { "type":"choice", "id", "label"?:string, "variant"?:"radio"|"dropdown", "options":[ { "value":string, "label":string } ] }
+- input:     { "type":"input", "id", "label"?:string, "value"?:string, "placeholder"?:string }
+- toggle:    { "type":"toggle", "id", "label"?:string, "value"?:boolean, "variant"?:"checkbox"|"switch" }
+- form:      { "type":"form", "id", "title"?:string, "children":[ ...primitives ] }
+- toolbar:   { "type":"toolbar", "id", "children":[ ...primitives ] }
+- progress:  { "type":"progress", "id", "value"?:number, "indeterminate"?:boolean }
+- image:     { "type":"image", "id", "src":string, "altText"?:string }
+- tree:      { "type":"tree", "id", "nodes":[ { "itemKey":string, "label"?:string, "children"?:[ ...nodes ] } ] }
+
+RULES:
+- The ROOT must be a container.
+- table REQUIRES columns AND rows (rows:[] when skeleton). list REQUIRES items:[]. chart REQUIRES chartType AND points:[].
+- tabs REQUIRES tabs:[]; each tab is { "label", "child" } where child is ONE primitive (usually a container/table).
+- A table row later looks like { "rowKey":string, "cells":{ fieldKey: value } } — you only emit the EMPTY skeleton, not rows.
+- dataRequirements: one entry per data-carrying container, naming EXACTLY the fieldKeys its columns/fields use.
+- INTERACTION: when the request implies picking between alternatives, render a choice (one option per alternative, stable values) — never plan a prose question. Editable parameters → input/toggle inside a form; primary commands → button with an action.
+- CHART TYPE is YOUR decision (Tier 2): time series / development over time → "line"; comparing categories → "bar"; share-of-whole → "pie". Each chart needs a dataRequirements entry with fields label + value.
+- SCALAR / KPI BLOCK (named single values like scores or metrics — NOT rows of a table): use a container with "loading":"skeleton" whose children are one small container per metric, each holding a "heading" (the label) and a VALUE node { "type":"text", "id":"<containerId>.<fieldKey>", "content":"" }. The value node id MUST be EXACTLY "<containerId>.<fieldKey>" — that id is how the fetched value is patched in. Add ONE dataRequirements entry for the block: { "containerId":"<id>", "fields":[ { "fieldKey", "label" }, … ] }. The main turn fills it with { containerId, fields:{ fieldKey: value } }, NOT rows. Use this for a header of scores/KPIs; use a table only for repeating records.
+- A fetched data set may be EMPTY — the table keeps rows:[]; never plan placeholder rows.
+- BE MINIMAL: compact JSON (no whitespace), only the containers the request needs, omit every optional prop you don't use. Latency scales with output length.
+
+EXAMPLE — "Zeige Kursdetails inkl. Teilnehmer als Panes":
+{ "tree": { "type":"container", "id":"root", "layout":"stack", "children":[
+  { "type":"tabs", "id":"detail_tabs", "tabs":[
+    { "label":"Übersicht", "child": { "type":"container", "id":"overview", "layout":"stack", "loading":"skeleton", "children":[ { "type":"text", "id":"overview_text", "content":"" } ] } },
+    { "label":"Teilnehmer", "child": { "type":"table", "id":"participants", "loading":"skeleton", "columns":[ { "fieldKey":"name", "label":"Name" }, { "fieldKey":"status", "label":"Status" } ], "rows":[] } }
+  ] }
+] },
+  "dataRequirements":[ { "containerId":"participants", "description":"Teilnehmerliste des Kurses", "fields":[ { "fieldKey":"name", "label":"Name" }, { "fieldKey":"status", "label":"Status" } ] } ] }
+
+EXAMPLE — a KPI/score header ("SEO-Score und Kennzahlen"):
+{ "tree": { "type":"container", "id":"root", "layout":"stack", "children":[
+  { "type":"container", "id":"scores", "layout":"grid", "loading":"skeleton", "children":[
+    { "type":"container", "id":"scores.seo_card", "layout":"stack", "children":[ { "type":"heading", "content":"SEO-Score", "level":4 }, { "type":"text", "id":"scores.seo", "content":"" } ] },
+    { "type":"container", "id":"scores.tech_card", "layout":"stack", "children":[ { "type":"heading", "content":"Technical", "level":4 }, { "type":"text", "id":"scores.technical", "content":"" } ] }
+  ] }
+] },
+  "dataRequirements":[ { "containerId":"scores", "description":"SEO-Kennzahlen", "fields":[ { "fieldKey":"seo", "label":"SEO-Score" }, { "fieldKey":"technical", "label":"Technical" } ] } ] }
+
+Output raw JSON only — no prose, no markdown fences.`;
+
+/** Models routinely ignore "raw JSON only" and wrap the object in markdown
+ *  fences or a prose preamble — extract the JSON payload before parsing. */
+function extractJsonPayload(raw: string): string {
+  let s = raw.trim();
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(s);
+  if (fenced?.[1]) s = fenced[1].trim();
+  if (!s.startsWith('{')) {
+    const start = s.indexOf('{');
+    const end = s.lastIndexOf('}');
+    if (start >= 0 && end > start) s = s.slice(start, end + 1);
+  }
+  return s;
+}
 
 function parseResult(raw: string): { tree: unknown; dataRequirements: DataRequirement[] } | null {
   let obj: unknown;
   try {
-    obj = JSON.parse(raw.trim());
+    obj = JSON.parse(extractJsonPayload(raw));
   } catch {
     return null;
   }
@@ -76,6 +144,8 @@ export async function composeSkeleton(opts: {
   llm: CompositionLlm;
   model: string;
   userText: string;
+  /** observability for the never-throw contract: every fallback states why. */
+  log?: (message: string) => void;
 }): Promise<SkeletonResult> {
   const fallback: SkeletonResult = {
     tree: structuredClone(FALLBACK_SKELETON),
@@ -86,6 +156,7 @@ export async function composeSkeleton(opts: {
   let user = `User request: ${opts.userText}`;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let raw: string;
+    const startedAt = Date.now();
     try {
       const result = await opts.llm.complete({
         model: opts.model,
@@ -94,11 +165,20 @@ export async function composeSkeleton(opts: {
         maxTokens: 2048,
       });
       raw = result.text;
-    } catch {
+      // Latency observability: the skeleton gates the first paint, so every
+      // model call logs its duration (a retry doubles the wait).
+      opts.log?.(
+        `[composition] model call attempt ${attempt + 1}: ${Date.now() - startedAt}ms, ${raw.length} chars`,
+      );
+    } catch (err) {
+      opts.log?.(
+        `[composition] llm call failed → fallback skeleton: ${err instanceof Error ? err.message : String(err)}`,
+      );
       return fallback;
     }
     const parsed = parseResult(raw);
     if (!parsed) {
+      opts.log?.(`[composition] attempt ${attempt + 1}: output not parseable as raw JSON`);
       user = `User request: ${opts.userText}\nYour previous output was not valid raw JSON. Emit ONLY the JSON object.`;
       continue;
     }
@@ -106,7 +186,9 @@ export async function composeSkeleton(opts: {
     if (valid.ok) {
       return { ...parsed, source: 'model' };
     }
+    opts.log?.(`[composition] attempt ${attempt + 1}: tree schema-invalid: ${valid.errors}`);
     user = `User request: ${opts.userText}\nYour previous tree was schema-invalid: ${valid.errors}. Emit a corrected JSON object.`;
   }
+  opts.log?.('[composition] both attempts schema-invalid → fallback skeleton');
   return fallback;
 }

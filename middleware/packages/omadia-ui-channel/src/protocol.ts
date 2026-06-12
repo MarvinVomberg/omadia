@@ -67,6 +67,25 @@ export interface TurnError {
   message: string;
 }
 
+/** One entry of the per-USER canvas registry (multi-canvas sidebar). The
+ *  registry is keyed by the authenticated subject server-side, so every
+ *  Omadia UI install of the same user sees the same canvas list. */
+export interface CanvasListEntry {
+  sessionId: string;
+  title: string;
+  color: number;
+  /** last server-authoritative tree — materialises the canvas on app start.
+   *  Stored opaquely (the CLIENT whitelist-validates before rendering). */
+  tree?: unknown;
+  revision?: string;
+}
+
+/** server → client: the user's persisted canvas list (answer to canvas_list_get). */
+export interface CanvasList {
+  type: 'canvas_list';
+  canvases: CanvasListEntry[];
+}
+
 // ───────────────────────── client → server ─────────────────────────
 
 export interface HandshakeSelect {
@@ -97,9 +116,123 @@ export interface ClientTurn {
   /** a `CanvasViewState`; passed through for referential continuity. */
   viewState?: unknown;
   viewStateTruncated?: boolean;
+  /** PR-9b-3 in-place action: the client's CURRENT canvas tree + the revision
+   *  it is at, sent on an ACTION turn so the orchestrator patches in place
+   *  instead of remounting a fresh skeleton. Same pair as `canvas_refresh`;
+   *  shape-validated by the channel, size-capped like a tree snapshot. Both
+   *  must be present together or neither — a lone field is ignored. */
+  basedOnRevision?: unknown;
+  currentTree?: unknown;
 }
 
-export type ClientMessage = HandshakeSelect | ClientTurn;
+// ── notifications (issue omadia-ui#15) — out-of-band from surface_* ──
+
+export type NotificationSeverity = 'info' | 'success' | 'warning' | 'error';
+
+/** server → client: a user-facing notification (NotificationRouter fan-out).
+ *  Structured and server-authoritative — never free text only. Severity maps
+ *  to a fixed UI element (info/success → toast, warning/error → banner). */
+export interface NotificationMsg {
+  type: 'notification';
+  /** stable id for dedupe + dismissal ack */
+  id: string;
+  severity: NotificationSeverity;
+  title: string;
+  body?: string;
+  /** producing plugin — shown as the source line */
+  source?: string;
+  /** typed action reusing the canvas action→turn plumbing (e.g. Retry) */
+  action?: { type: string; payload?: unknown; label?: string };
+  /** coalesce key — newer notification replaces an undismissed older one */
+  dedupeKey?: string;
+  /** auto-dismiss for transient toasts; errors/actionables never carry one */
+  ttlMs?: number;
+  /** target canvas session, or absent → app-global */
+  scope?: string;
+}
+
+/** client → server: the user saw/dismissed a notification. */
+export interface ClientNotificationAck {
+  type: 'notification_ack';
+  id?: unknown;
+}
+
+// ── desktops (multi-desktop workspaces, follow-up to omadia-ui#14) ──
+
+/** A desktop layout node — keyed by canvasSessionId (client slot ids are
+ *  device-local and do not travel across installs). */
+export type DesktopLayoutNode =
+  | { kind: 'leaf'; sessionId: string }
+  | { kind: 'split'; dir: 'columns' | 'rows'; ratio: number; a: DesktopLayoutNode; b: DesktopLayoutNode };
+
+/** One persisted desktop: a named, colored tiling layout. `updatedAt` drives
+ *  last-write-wins merging across installs. */
+export interface DesktopListEntry {
+  desktopId: string;
+  name: string;
+  color: number;
+  updatedAt: number;
+  layout: DesktopLayoutNode;
+}
+
+/** client → server: fetch the user's persisted desktops (app-start sync). */
+export interface ClientDesktopListGet {
+  type: 'desktop_list_get';
+}
+
+/** client → server: replace the user's persisted desktops. */
+export interface ClientDesktopListPut {
+  type: 'desktop_list_put';
+  desktops?: unknown;
+}
+
+/** client → server: fetch the user's persisted canvas list (app start sync). */
+export interface ClientCanvasListGet {
+  type: 'canvas_list_get';
+}
+
+/** client → server: replace the user's persisted canvas list. */
+export interface ClientCanvasListPut {
+  type: 'canvas_list_put';
+  canvases?: unknown;
+}
+
+/** client → server: deterministic refresh (protocol 1.1 additive, omadia-ui#5).
+ *  Carries the client's CURRENT tree + revision; the server re-fetches the
+ *  data behind the tree's containers and answers with ordinary surface_patch
+ *  events whose first publish per container REPLACES the stale rows. No new
+ *  view is composed. Completion signals via turn_complete/turn_error. */
+export interface ClientCanvasRefresh {
+  type: 'canvas_refresh';
+  /** optional client-supplied correlation id; the server mints one if absent */
+  turnId?: string;
+  /** the revision the client's tree is at — patches build on it */
+  basedOnRevision?: unknown;
+  /** the client's current canvas tree (server is stateless cross-turn in v1) */
+  currentTree?: unknown;
+  /** optional containerId — refresh a single table/chart instead of all */
+  scope?: unknown;
+}
+
+/** client → server: abort the named in-flight turn (omadia-ui#13, additive).
+ *  The channel stops consuming the orchestrator stream immediately and
+ *  answers `turn_error { forTurn, message: 'aborted' }`; surface events
+ *  already emitted stay applied. Stale/unknown ids are a no-op. */
+export interface ClientTurnAbort {
+  type: 'turn_abort';
+  forTurn?: unknown;
+}
+
+export type ClientMessage =
+  | HandshakeSelect
+  | ClientTurn
+  | ClientCanvasListGet
+  | ClientCanvasListPut
+  | ClientDesktopListGet
+  | ClientDesktopListPut
+  | ClientCanvasRefresh
+  | ClientTurnAbort
+  | ClientNotificationAck;
 
 /**
  * The surface_* event types forwarded 1:1 to the canvas client — the runtime
@@ -132,8 +265,109 @@ export function parseClientMessage(raw: string): ClientMessage | null {
   }
   if (typeof obj !== 'object' || obj === null) return null;
   const type = (obj as { type?: unknown }).type;
-  if (type === 'handshake_select' || type === 'turn') {
+  if (
+    type === 'handshake_select' ||
+    type === 'turn' ||
+    type === 'canvas_list_get' ||
+    type === 'canvas_list_put' ||
+    type === 'desktop_list_get' ||
+    type === 'desktop_list_put' ||
+    type === 'canvas_refresh' ||
+    type === 'turn_abort' ||
+    type === 'notification_ack'
+  ) {
     return obj as ClientMessage;
   }
   return null;
+}
+
+const MAX_DESKTOPS = 24;
+const MAX_LAYOUT_DEPTH = 8;
+
+function sanitizeDesktopLayout(node: unknown, depth: number): DesktopLayoutNode | null {
+  if (depth > MAX_LAYOUT_DEPTH || typeof node !== 'object' || node === null) return null;
+  const n = node as Record<string, unknown>;
+  if (n['kind'] === 'leaf') {
+    return typeof n['sessionId'] === 'string' && n['sessionId'].length > 0
+      ? { kind: 'leaf', sessionId: (n['sessionId'] as string).slice(0, 128) }
+      : null;
+  }
+  if (n['kind'] === 'split' && (n['dir'] === 'columns' || n['dir'] === 'rows')) {
+    const a = sanitizeDesktopLayout(n['a'], depth + 1);
+    const b = sanitizeDesktopLayout(n['b'], depth + 1);
+    if (a && b) {
+      return {
+        kind: 'split',
+        dir: n['dir'],
+        ratio:
+          typeof n['ratio'] === 'number' ? Math.min(Math.max(n['ratio'], 0.15), 0.85) : 0.5,
+        a,
+        b,
+      };
+    }
+    return a ?? b; // a leaf that failed sanitisation collapses its split
+  }
+  return null;
+}
+
+/** Whitelist-sanitise a client-supplied desktop list (max 24 entries). */
+export function sanitizeDesktopList(raw: unknown): DesktopListEntry[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(
+      (e): e is Record<string, unknown> => typeof e === 'object' && e !== null && !Array.isArray(e),
+    )
+    .map((e): DesktopListEntry | null => {
+      if (typeof e['desktopId'] !== 'string' || e['desktopId'].length === 0) return null;
+      const layout = sanitizeDesktopLayout(e['layout'], 0);
+      if (!layout) return null;
+      return {
+        desktopId: (e['desktopId'] as string).slice(0, 64),
+        name:
+          typeof e['name'] === 'string' && e['name'].trim()
+            ? (e['name'] as string).slice(0, 48)
+            : 'Desktop',
+        color:
+          typeof e['color'] === 'number' && Number.isInteger(e['color'])
+            ? Math.min(Math.max(e['color'], 0), 5)
+            : 0,
+        updatedAt: typeof e['updatedAt'] === 'number' ? e['updatedAt'] : 0,
+        layout,
+      };
+    })
+    .filter((e): e is DesktopListEntry => e !== null)
+    .slice(0, MAX_DESKTOPS);
+}
+
+/** Whitelist-sanitise a client-supplied canvas list (max 50 entries). */
+export function sanitizeCanvasList(raw: unknown): CanvasListEntry[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(
+      (e): e is Record<string, unknown> => typeof e === 'object' && e !== null && !Array.isArray(e),
+    )
+    .filter((e) => typeof e['sessionId'] === 'string' && (e['sessionId'] as string).length > 0)
+    .slice(0, 50)
+    .map((e) => {
+      // tree blobs are size-capped (256 KB serialised) — oversized ones are
+      // dropped silently; the canvas then cold-starts like before.
+      let tree: unknown;
+      if (typeof e['tree'] === 'object' && e['tree'] !== null) {
+        try {
+          if (JSON.stringify(e['tree']).length <= 262_144) tree = e['tree'];
+        } catch {
+          /* circular / unserialisable → drop */
+        }
+      }
+      return {
+        sessionId: (e['sessionId'] as string).slice(0, 128),
+        title: typeof e['title'] === 'string' ? (e['title'] as string).slice(0, 64) : '',
+        color:
+          typeof e['color'] === 'number' && Number.isInteger(e['color'])
+            ? Math.min(Math.max(e['color'], 0), 5)
+            : 0,
+        ...(tree !== undefined ? { tree } : {}),
+        ...(typeof e['revision'] === 'string' ? { revision: (e['revision'] as string).slice(0, 64) } : {}),
+      };
+    });
 }

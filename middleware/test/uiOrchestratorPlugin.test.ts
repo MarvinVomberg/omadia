@@ -13,7 +13,13 @@ import type { PluginContext } from '../packages/plugin-api/src/index.js';
 import {
   activate,
   CANVAS_CHAT_AGENT_SERVICE,
+  CANVAS_CHOICE_TOOL,
+  CANVAS_PUBLISH_TOOL,
+  handleCanvasPublishChoice,
+  handleCanvasPublishRows,
 } from '../packages/omadia-ui-orchestrator/src/plugin.js';
+import { parseToolEmittedStructuredPayload } from '../packages/harness-orchestrator/src/canvasSentinels.js';
+import { composeStructuredPayloadPatch } from '../packages/omadia-ui-orchestrator/src/patchComposition.js';
 
 /**
  * PR-9a — the omadia-ui-orchestrator skeleton. activate() publishes
@@ -95,6 +101,271 @@ describe('omadia-ui-orchestrator skeleton', () => {
     assert.ok(reg.get('canvasChatAgent'));
     await handle.close();
     assert.equal(reg.get('canvasChatAgent'), undefined);
+  });
+});
+
+describe('canvas_publish_rows producer tool', () => {
+  it('emits a parseable structured-payload sentinel that composes onto a skeleton table', async () => {
+    const out = await handleCanvasPublishRows({
+      containerId: 'courses',
+      rows: [
+        { courseName: 'Sea Survival', date: '2026-06-15' },
+        { courseName: 'First Aid', date: '2026-06-16' },
+      ],
+      prose: '2 Kurse veröffentlicht.',
+    });
+    const payload = parseToolEmittedStructuredPayload(out);
+    assert.ok(payload, 'handler output carries the sentinel');
+    assert.equal(payload.prose, '2 Kurse veröffentlicht.');
+
+    const baseTree = {
+      type: 'container',
+      id: 'root',
+      layout: 'stack',
+      children: [
+        {
+          type: 'table',
+          id: 'courses',
+          loading: 'skeleton',
+          columns: [
+            { fieldKey: 'courseName', label: 'Kurs' },
+            { fieldKey: 'date', label: 'Datum' },
+          ],
+          rows: [],
+        },
+      ],
+    };
+    const composed = composeStructuredPayloadPatch({
+      baseTree,
+      payload,
+      dataRequirements: [{ containerId: 'courses', description: 'Kurse', fields: [] }],
+    });
+    assert.ok(composed, 'payload maps onto the skeleton table');
+    assert.equal(composed.patches[0]?.op, 'replace'); // loading: skeleton → none
+    assert.equal(composed.patches.length, 3, 'loading replace + 2 row adds');
+  });
+
+  it('emits a fields sentinel that fills a scalar/KPI container (no rows)', async () => {
+    const out = await handleCanvasPublishRows({
+      containerId: 'scores',
+      fields: { seo: 82, technical: 'OK' },
+      prose: 'Scores veröffentlicht.',
+    });
+    const payload = parseToolEmittedStructuredPayload(out);
+    assert.ok(payload, 'handler output carries the sentinel');
+    // a fields publish carries `fields`, not `rows`
+    assert.deepEqual((payload.data as { fields?: unknown }).fields, { seo: 82, technical: 'OK' });
+    assert.equal((payload.data as { rows?: unknown }).rows, undefined);
+
+    const baseTree = {
+      type: 'container',
+      id: 'root',
+      layout: 'stack',
+      children: [
+        {
+          type: 'container',
+          id: 'scores',
+          layout: 'grid',
+          loading: 'skeleton',
+          children: [
+            { type: 'text', id: 'scores.seo', content: '' },
+            { type: 'text', id: 'scores.technical', content: '' },
+          ],
+        },
+      ],
+    };
+    const composed = composeStructuredPayloadPatch({
+      baseTree,
+      payload,
+      dataRequirements: [{ containerId: 'scores', description: 'Scores', fields: [] }],
+    });
+    assert.ok(composed, 'fields payload maps onto the scalar container');
+    const tree = composed.nextTree as {
+      children: Array<{ loading?: string; children: Array<{ content?: string }> }>;
+    };
+    assert.equal(tree.children[0]?.loading, 'none');
+    assert.equal(tree.children[0]?.children[0]?.content, '82');
+    assert.equal(tree.children[0]?.children[1]?.content, 'OK');
+  });
+
+  it('maps agent-authored actions onto the table as suggestedActions and strips markdown in cells', async () => {
+    const out = await handleCanvasPublishRows({
+      containerId: 'courses',
+      rows: [{ courseName: '**Sea Survival**' }],
+      actions: [
+        { id: 'unenroll', label: 'Teilnehmer abmelden', prompt: 'Melde diesen Teilnehmer ab' },
+        { label: 'E-Mail senden' },
+      ],
+    });
+    const payload = parseToolEmittedStructuredPayload(out);
+    assert.ok(payload);
+    const baseTree = {
+      type: 'container',
+      id: 'root',
+      layout: 'stack',
+      children: [
+        {
+          type: 'table',
+          id: 'courses',
+          loading: 'skeleton',
+          columns: [{ fieldKey: 'courseName', label: 'Kurs' }],
+          rows: [],
+        },
+      ],
+    };
+    const composed = composeStructuredPayloadPatch({
+      baseTree,
+      payload,
+      dataRequirements: [{ containerId: 'courses', description: 'Kurse', fields: [] }],
+    });
+    assert.ok(composed, 'rows + actions compose');
+    const actionsPatch = composed.patches.find((p) => p.path.endsWith('/suggestedActions'));
+    assert.ok(actionsPatch, 'suggestedActions patch emitted');
+    const acts = actionsPatch.value as Array<{ id: string; label: string; effect: string; prompt?: string }>;
+    assert.equal(acts.length, 2);
+    assert.equal(acts[0]?.id, 'unenroll');
+    assert.equal(acts[0]?.effect, 'internal');
+    assert.equal(acts[1]?.label, 'E-Mail senden');
+    const rowPatch = composed.patches.find((p) => p.path.endsWith('/rows/-'));
+    assert.equal(
+      (rowPatch?.value as { cells: Record<string, unknown> }).cells['courseName'],
+      'Sea Survival',
+      'markdown emphasis stripped from cell values',
+    );
+  });
+
+  it('maps rows published against a CHART container onto points and resolves loading', async () => {
+    const out = await handleCanvasPublishRows({
+      containerId: 'bookings_chart',
+      rows: [
+        { label: 'KW 25', value: 12 },
+        { label: 'KW 26', value: 7 },
+      ],
+    });
+    const payload = parseToolEmittedStructuredPayload(out);
+    assert.ok(payload);
+    const baseTree = {
+      type: 'container',
+      id: 'root',
+      layout: 'stack',
+      children: [
+        { type: 'chart', id: 'bookings_chart', chartType: 'bar', loading: 'skeleton', points: [] },
+      ],
+    };
+    const composed = composeStructuredPayloadPatch({
+      baseTree,
+      payload,
+      dataRequirements: [{ containerId: 'bookings_chart', description: 'Buchungen', fields: [] }],
+    });
+    assert.ok(composed, 'rows map onto the chart');
+    assert.equal(composed.patches[0]?.op, 'replace'); // loading → none
+    assert.equal(composed.patches.length, 3, 'loading + 2 point adds');
+    const point = composed.patches[1]?.value as { pointKey: string; label: string; value: number };
+    assert.equal(point.label, 'KW 25');
+    assert.equal(point.value, 12);
+    assert.ok(point.pointKey.length > 0);
+  });
+
+  it('returns an error string (no sentinel) for a missing containerId or rows array', async () => {
+    assert.match(await handleCanvasPublishRows({ containerId: '', rows: [] }), /^Error:/);
+    assert.match(await handleCanvasPublishRows({ containerId: 'courses' }), /^Error:/);
+    assert.equal(
+      parseToolEmittedStructuredPayload(await handleCanvasPublishRows({ containerId: '', rows: [] })),
+      undefined,
+    );
+  });
+
+  it('accepts empty rows (empty data set) and still resolves the skeleton loading state', async () => {
+    const out = await handleCanvasPublishRows({ containerId: 'courses', rows: [] });
+    const payload = parseToolEmittedStructuredPayload(out);
+    assert.ok(payload, 'empty data set still emits the sentinel');
+    assert.match(payload.prose, /empty/);
+
+    const baseTree = {
+      type: 'container',
+      id: 'root',
+      layout: 'stack',
+      children: [
+        {
+          type: 'table',
+          id: 'courses',
+          loading: 'skeleton',
+          columns: [{ fieldKey: 'courseName', label: 'Kurs' }],
+          rows: [],
+        },
+      ],
+    };
+    const composed = composeStructuredPayloadPatch({
+      baseTree,
+      payload,
+      dataRequirements: [{ containerId: 'courses', description: 'Kurse', fields: [] }],
+    });
+    assert.ok(composed, 'empty payload still composes the loading-clearing patch');
+    assert.deepEqual(composed.patches, [
+      { op: 'replace', path: '/children/0/loading', value: 'none' },
+    ]);
+  });
+});
+
+describe('canvas_publish_choice producer tool', () => {
+  it('emits a sentinel that appends a choice element to the root container', async () => {
+    const out = await handleCanvasPublishChoice({
+      question: 'Welchen Kurs meinst du?',
+      options: [
+        { value: 'heinemann', label: 'Manual Handling — Heinemann, 09:00' },
+        { value: 'mukran', label: 'Manual Handling — Mukran, 08:30' },
+      ],
+      prose: 'Zwei Kurse gefunden.',
+    });
+    const payload = parseToolEmittedStructuredPayload(out);
+    assert.ok(payload, 'handler output carries the sentinel');
+    assert.equal(payload.prose, 'Zwei Kurse gefunden.');
+
+    const baseTree = { type: 'container', id: 'root', layout: 'stack', children: [] };
+    const composed = composeStructuredPayloadPatch({ baseTree, payload, dataRequirements: [] });
+    assert.ok(composed, 'choice payload composes onto the root container');
+    assert.equal(composed.patches.length, 1);
+    assert.equal(composed.patches[0]?.path, '/children/-');
+    const node = composed.patches[0]?.value as { type: string; label: string; options: unknown[] };
+    assert.equal(node.type, 'choice');
+    assert.equal(node.label, 'Welchen Kurs meinst du?');
+    assert.equal(node.options.length, 2);
+  });
+
+  it('returns an error string (no sentinel) for a missing question or fewer than two options', async () => {
+    assert.match(await handleCanvasPublishChoice({ question: '', options: [] }), /^Error:/);
+    assert.match(
+      await handleCanvasPublishChoice({ question: 'Which?', options: [{ value: 'a', label: 'A' }] }),
+      /^Error:/,
+    );
+  });
+
+  it('registers the tool when the context has a tools accessor and disposes on close', async () => {
+    const reg = new Map<string, unknown>();
+    const registered: string[] = [];
+    let disposed = 0;
+    const ctx = {
+      log: () => {},
+      services: {
+        get: <T>(name: string): T | undefined => reg.get(name) as T | undefined,
+        provide: (name: string, impl: unknown) => {
+          reg.set(name, impl);
+          return () => reg.delete(name);
+        },
+      },
+      tools: {
+        register: (spec: { name: string }) => {
+          registered.push(spec.name);
+          return () => {
+            disposed += 1;
+          };
+        },
+      },
+    } as unknown as PluginContext;
+    const handle = await activate(ctx);
+    assert.deepEqual(registered, [CANVAS_PUBLISH_TOOL, CANVAS_CHOICE_TOOL]);
+    await handle.close();
+    assert.equal(disposed, 2);
   });
 });
 

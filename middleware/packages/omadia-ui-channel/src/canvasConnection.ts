@@ -9,7 +9,11 @@ import type { TargetRef } from '@omadia/plugin-api';
 
 import {
   parseClientMessage,
+  sanitizeCanvasList,
+  sanitizeDesktopList,
   SURFACE_EVENT_TYPES,
+  type CanvasListEntry,
+  type DesktopListEntry,
   type ClientTurn,
   type HandshakeAck,
   type HandshakeError,
@@ -33,6 +37,30 @@ export interface CanvasConnectionDeps {
   tenantId?: string;
   /** mint a handshakeId / canvasSessionId / turnId. Injected for deterministic tests. */
   mintId: () => string;
+  /** per-USER canvas list persistence (multi-canvas sidebar sync). Optional —
+   *  without it `canvas_list_get` answers with an empty list and puts are
+   *  dropped, so old deployments stay wire-compatible. */
+  canvasRegistry?: {
+    load(subject: string): Promise<CanvasListEntry[]>;
+    save(subject: string, canvases: CanvasListEntry[]): Promise<void>;
+  };
+  /** per-USER desktop registry (multi-desktop workspaces). Optional — old
+   *  deployments answer desktop_list_get with an empty list. */
+  desktopRegistry?: {
+    load(subject: string): Promise<DesktopListEntry[]>;
+    save(subject: string, desktops: DesktopListEntry[]): Promise<void>;
+  };
+  /** Notifications (omadia-ui#15): once the handshake completes, the
+   *  connection registers a sink so the plugin's NotificationRouter handler
+   *  can push out-of-band `notification` messages to this user's sockets.
+   *  Returns a dispose called on socket close. Optional — old deployments
+   *  simply never emit notifications. */
+  registerNotificationSink?: (
+    subject: string,
+    sink: (msg: unknown) => void,
+  ) => () => void;
+  /** dismissal/seen ack from the client (history sync is a later slice). */
+  onNotificationAck?: (subject: string, notificationId: string) => void;
   log?: (msg: string) => void;
 }
 
@@ -69,14 +97,24 @@ export function handleCanvasSocket(
   // Per-connection turn queue — serialises turns so two in-flight turns can't
   // interleave surface frames on the same socket.
   let turnChain: Promise<void> = Promise.resolve();
+  // canvas_refresh rate limit window (issue #5 open question #1)
+  let lastRefreshAt = 0;
+  // the turn currently consuming the orchestrator stream (turn_abort target)
+  let activeTurn: { turnId: string; abort: () => void } | null = null;
 
   const send = (msg: unknown): void => {
     if (phase === 'closed') return;
     socket.send(JSON.stringify(msg));
   };
 
+  // notifications (omadia-ui#15): sink registered once the handshake
+  // completes; disposed on close so the router never pushes into a dead socket.
+  let disposeNotificationSink: (() => void) | undefined;
+
   socket.onClose(() => {
     phase = 'closed';
+    disposeNotificationSink?.();
+    disposeNotificationSink = undefined;
   });
 
   // 1. Server-initiated offer.
@@ -141,10 +179,115 @@ export function handleCanvasSocket(
       };
       send(ack);
       phase = 'ready';
+      disposeNotificationSink = deps.registerNotificationSink?.(session.subject, send);
       return;
     }
 
     // phase === 'ready'
+    if (msg.type === 'notification_ack') {
+      if (typeof msg.id === 'string' && msg.id.length > 0) {
+        deps.onNotificationAck?.(session.subject, msg.id);
+      }
+      return;
+    }
+    if (msg.type === 'canvas_list_get') {
+      if (!deps.canvasRegistry) {
+        send({ type: 'canvas_list', canvases: [] });
+        return;
+      }
+      void deps.canvasRegistry.load(session.subject).then(
+        (canvases) => send({ type: 'canvas_list', canvases }),
+        (err: unknown) => {
+          deps.log?.(`[ui-channel] canvas_list load failed: ${String(err)}`);
+          send({ type: 'canvas_list', canvases: [] });
+        },
+      );
+      return;
+    }
+    if (msg.type === 'canvas_list_put') {
+      const canvases = sanitizeCanvasList(msg.canvases);
+      void deps.canvasRegistry?.save(session.subject, canvases).catch((err: unknown) => {
+        deps.log?.(`[ui-channel] canvas_list save failed: ${String(err)}`);
+      });
+      return;
+    }
+    if (msg.type === 'desktop_list_get') {
+      if (!deps.desktopRegistry) {
+        send({ type: 'desktop_list', desktops: [] });
+        return;
+      }
+      void deps.desktopRegistry.load(session.subject).then(
+        (desktops) => send({ type: 'desktop_list', desktops }),
+        (err: unknown) => {
+          deps.log?.(`[ui-channel] desktop_list load failed: ${String(err)}`);
+          send({ type: 'desktop_list', desktops: [] });
+        },
+      );
+      return;
+    }
+    if (msg.type === 'desktop_list_put') {
+      const desktops = sanitizeDesktopList(msg.desktops);
+      void deps.desktopRegistry?.save(session.subject, desktops).catch((err: unknown) => {
+        deps.log?.(`[ui-channel] desktop_list save failed: ${String(err)}`);
+      });
+      return;
+    }
+    if (msg.type === 'turn_abort') {
+      // abort the named in-flight turn (omadia-ui#13); a stale/unknown id is
+      // a no-op — the turn it referred to already ended
+      if (typeof msg.forTurn === 'string' && activeTurn?.turnId === msg.forTurn) {
+        activeTurn.abort();
+      }
+      return;
+    }
+    if (msg.type === 'canvas_refresh') {
+      // Deterministic refresh (protocol 1.1, omadia-ui#5). Joins the SAME
+      // turnChain as real turns — a refresh racing an in-flight turn
+      // serialises behind it; the revision equality check on the resulting
+      // patches settles the rest (issue's open question #3).
+      const turnId = msg.turnId && msg.turnId.length > 0 ? msg.turnId : deps.mintId();
+      // Rate limit (issue #5 open question #1): a refresh is spammable far
+      // faster than a chat turn — one per canvas session per 3s window.
+      const now = Date.now();
+      if (now - lastRefreshAt < 3000) {
+        send({ type: 'turn_error', forTurn: turnId, message: 'refresh rate-limited' });
+        return;
+      }
+      lastRefreshAt = now;
+      if (
+        typeof msg.basedOnRevision !== 'string' ||
+        msg.basedOnRevision.length === 0 ||
+        !isPlainObject(msg.currentTree) ||
+        (msg.scope !== undefined && typeof msg.scope !== 'string')
+      ) {
+        send({
+          type: 'turn_error',
+          forTurn: turnId,
+          message:
+            'invalid canvas_refresh: basedOnRevision (string) and currentTree (object) required',
+        });
+        return;
+      }
+      // Same cap as the registry's tree snapshots — the client echoes a tree
+      // the server once produced; anything bigger is hostile or corrupt.
+      if (JSON.stringify(msg.currentTree).length > 262_144) {
+        send({ type: 'turn_error', forTurn: turnId, message: 'canvas_refresh: currentTree too large' });
+        return;
+      }
+      const turn = formIncomingTurn({ type: 'turn', turnId, text: '' }, turnId);
+      turn.metadata = {
+        ...turn.metadata,
+        canvasRefresh: {
+          basedOnRevision: msg.basedOnRevision,
+          currentTree: msg.currentTree,
+          ...(typeof msg.scope === 'string' ? { scope: msg.scope } : {}),
+        },
+      };
+      turnChain = turnChain.then(() => runTurn(turn, turnId)).catch(() => {
+        /* runTurn never rejects; guard the chain anyway. */
+      });
+      return;
+    }
     if (msg.type !== 'turn') return;
     const turnId =
       msg.turnId && msg.turnId.length > 0 ? msg.turnId : deps.mintId();
@@ -158,7 +301,7 @@ export function handleCanvasSocket(
       return;
     }
     // Serialise: each turn runs to completion before the next starts.
-    turnChain = turnChain.then(() => runTurn(msg, turnId)).catch(() => {
+    turnChain = turnChain.then(() => runTurn(formIncomingTurn(msg, turnId), turnId)).catch(() => {
       /* runTurn never rejects (it sends turn_error); guard the chain anyway. */
     });
   });
@@ -179,14 +322,48 @@ export function handleCanvasSocket(
     ) {
       return 'invalid action: expected an object with a string `type`';
     }
+    // PR-9b-3 in-place action: currentTree + basedOnRevision must arrive as a
+    // pair, shaped + size-capped like a refresh tree (the client echoes a tree
+    // the server once produced). A lone field is a client bug, not a no-op.
+    if (msg.currentTree !== undefined || msg.basedOnRevision !== undefined) {
+      if (
+        typeof msg.basedOnRevision !== 'string' ||
+        msg.basedOnRevision.length === 0 ||
+        !isPlainObject(msg.currentTree)
+      ) {
+        return 'invalid canvasState: basedOnRevision (non-empty string) and currentTree (object) required together';
+      }
+      if (JSON.stringify(msg.currentTree).length > 262_144) {
+        return 'canvasState: currentTree too large';
+      }
+    }
     return null;
   }
 
-  async function runTurn(msg: ClientTurn, turnId: string): Promise<void> {
-    const turn = formIncomingTurn(msg, turnId);
+  async function runTurn(turn: IncomingTurn, turnId: string): Promise<void> {
     let terminated = false;
+    // turn_abort (omadia-ui#13): race the stream against the abort signal so
+    // the abort takes effect IMMEDIATELY, not on the next event. Already-sent
+    // surface events stay applied; the canvas keeps what rendered.
+    let signalAbort: () => void = () => {};
+    const abortPromise = new Promise<'aborted'>((resolve) => {
+      signalAbort = () => resolve('aborted');
+    });
+    activeTurn = { turnId, abort: () => signalAbort() };
+    const it = deps.handleTurnStream(turn)[Symbol.asyncIterator]();
     try {
-      for await (const ev of deps.handleTurnStream(turn)) {
+      for (;;) {
+        const r = await Promise.race([it.next(), abortPromise]);
+        if (r === 'aborted') {
+          // unwind the orchestrator generator stack (finally blocks run);
+          // never await it — a hung tool call must not delay the abort
+          void it.return?.().catch(() => {});
+          send({ type: 'turn_error', forTurn: turnId, message: 'aborted' });
+          terminated = true;
+          break;
+        }
+        if (r.done) break;
+        const ev = r.value;
         if (phase === 'closed') return;
         if (SURFACE_EVENT_TYPES.has(ev.type)) {
           send(ev); // forward the surface_* event 1:1
@@ -211,6 +388,8 @@ export function handleCanvasSocket(
         forTurn: turnId,
         message: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      activeTurn = null;
     }
   }
 
@@ -240,6 +419,20 @@ export function handleCanvasSocket(
         // ride metadata until the SDK grows typed fields (protocol 1.0 §5.1).
         ...(localOperations.length > 0 ? { localOperations } : {}),
         ...(msg.action !== undefined ? { action: msg.action } : {}),
+        // PR-9b-3: the client's live tree for in-place patching, threaded the
+        // same metadata ride as `action`. Shape already guarded by
+        // validateTurnInput; a canvas-aware orchestrator skips the skeleton
+        // when this is present and synthesises on top of `currentTree`.
+        ...(typeof msg.basedOnRevision === 'string' &&
+        msg.basedOnRevision.length > 0 &&
+        isPlainObject(msg.currentTree)
+          ? {
+              canvasState: {
+                basedOnRevision: msg.basedOnRevision,
+                currentTree: msg.currentTree,
+              },
+            }
+          : {}),
       },
     };
     // tenantId: populate when the host published one; otherwise leave unset so

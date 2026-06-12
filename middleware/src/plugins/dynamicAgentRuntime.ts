@@ -5,6 +5,8 @@ import { pathToFileURL } from 'node:url';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { z } from 'zod';
 
+import { canvasOutputToolIds } from '../platform/canvasOutputRegistry.js';
+import { deterministicActionToolIds } from '../platform/deterministicActionRegistry.js';
 import { createPluginContext } from '../platform/pluginContext.js';
 import type { PluginRouteRegistry } from '../platform/pluginRouteRegistry.js';
 import type { NotificationRouter } from '../platform/notificationRouter.js';
@@ -79,6 +81,7 @@ interface UploadedToolkit {
         // triggers the existing correctionPrompt retry loop.
         readonly output?: z.ZodType<unknown>;
         run(input: unknown): Promise<unknown>;
+        runStream?(input: unknown): AsyncGenerator<unknown>;
       }
     | LocalSubAgentTool
   >;
@@ -100,6 +103,15 @@ interface ActiveAgent {
   agentId: string;
   handle: UploadedAgentHandle;
   domainTool: DomainTool;
+  /** Raw toolkit tools as returned by the plugin handle. Kept alongside the
+   *  bridged LocalSubAgentTool array so the kernel can reach an UploadedToolkit
+   *  tool's optional `runStream()` directly, without routing through the
+   *  sub-agent model loop or inspecting its sentinel shapes. */
+  rawTools: UploadedToolkit['tools'];
+  /** Bridged sub-agent tools, kept so the kernel can invoke ONE of them
+   *  directly by id (deterministic-action fast-path) without driving the
+   *  sub-agent's model loop. Same instances the LocalSubAgent runs. */
+  subAgentTools: LocalSubAgentTool[];
   /** OB-29-1 — dispose handle for the `subAgent:<agentId>` ServiceRegistry
    *  entry. Called on deactivate so a hot-upgrade doesn't leave a stale
    *  DomainTool reachable via `ctx.subAgent.ask`. */
@@ -133,6 +145,22 @@ export interface DynamicAgentRuntimeDeps {
   /** Kernel-wide background-job scheduler. Plugin-contributed jobs register
    *  here via `ctx.jobs.register(spec, handler)`. */
   jobScheduler: JobScheduler;
+  /** Canvas-output autodiscovery: manifest capability entries declaring
+   *  `canvas_output: true` are resolved into this registry on (de)activation
+   *  so the ui-orchestrator can derive its sentinel allow-set without
+   *  operator config. Optional — absent in narrow test contexts. */
+  canvasOutputRegistry?: {
+    register(pluginId: string, toolIds: readonly string[]): void;
+    unregister(pluginId: string): void;
+  };
+  /** Deterministic-action autodiscovery: manifest capability entries declaring
+   *  `deterministic_action: true` are resolved into this registry on
+   *  (de)activation so the ui-orchestrator can dispatch them LLM-free without
+   *  operator config. Optional — absent in narrow test contexts. */
+  deterministicActionRegistry?: {
+    register(pluginId: string, toolIds: readonly string[]): void;
+    unregister(pluginId: string): void;
+  };
   log?: (...args: unknown[]) => void;
 }
 
@@ -428,9 +456,34 @@ export class DynamicAgentRuntime {
       agentId,
       handle,
       domainTool,
+      rawTools: handle.toolkit.tools,
+      subAgentTools,
       disposeSubAgentService,
     });
     this.orchestrator?.registerDomainTool(domainTool);
+
+    // Canvas-output autodiscovery: resolve `canvas_output: true` capability
+    // declarations from the raw manifest into the kernel registry. Hot
+    // installs flow through this same path, so a freshly uploaded plugin is
+    // authorised for canvas sentinels without any orchestrator re-activation.
+    const canvasOutputIds = canvasOutputToolIds(catalogEntry.manifest);
+    if (canvasOutputIds.length > 0) {
+      this.deps.canvasOutputRegistry?.register(agentId, canvasOutputIds);
+      log(
+        `[dynamic-runtime] canvas-output capabilities registered for ${agentId}: ${canvasOutputIds.join(', ')}`,
+      );
+    }
+
+    // Deterministic-action autodiscovery: same declare → resolve → derive path
+    // as canvas-output. A tool declaring `deterministic_action: true` becomes
+    // dispatchable LLM-free via the orchestrator fast-path + agentToolInvoker.
+    const deterministicActionIds = deterministicActionToolIds(catalogEntry.manifest);
+    if (deterministicActionIds.length > 0) {
+      this.deps.deterministicActionRegistry?.register(agentId, deterministicActionIds);
+      log(
+        `[dynamic-runtime] deterministic-action capabilities registered for ${agentId}: ${deterministicActionIds.join(', ')}`,
+      );
+    }
 
     // Circuit-breaker: clear any prior failure counter so an agent that
     // recovers (e.g. after a config fix + re-upload) returns to a healthy
@@ -459,6 +512,9 @@ export class DynamicAgentRuntime {
     // re-runs activate() which registers a fresh DomainTool; without this
     // dispose, ServiceRegistry would throw 'duplicate provider'.
     entry.disposeSubAgentService();
+    // Symmetric to the activate-time canvas-output registration.
+    this.deps.canvasOutputRegistry?.unregister(agentId);
+    this.deps.deterministicActionRegistry?.unregister(agentId);
     try {
       await withTimeout(
         entry.handle.close(),
@@ -516,6 +572,73 @@ export class DynamicAgentRuntime {
   domainToolFor(agentId: string): DomainTool | undefined {
     return this.active.get(agentId)?.domainTool;
   }
+
+  /** Invoke ONE active agent-plugin tool DIRECTLY by its id, bypassing the
+   *  sub-agent model loop entirely. Powers the orchestrator's
+   *  deterministic-action fast-path: an action whose `type` names a
+   *  `deterministic_action: true` tool runs that tool's bridged handler and
+   *  returns its raw result string (carrying any `_pendingCanvasTree` /
+   *  `_pendingSurfacePatch` sentinel). Returns `undefined` when no active agent
+   *  owns a tool with this id — the caller then falls back to the normal path.
+   *
+   *  This is the kernel half of "agents ship their own deterministic UIs": the
+   *  registry says WHICH tools are deterministic, this says HOW to run one
+   *  without a model. Data-driven agents never reach here — they go through the
+   *  domain tool + compose path instead. */
+  async invokeAgentTool(toolId: string, input: unknown): Promise<string | undefined> {
+    for (const entry of this.active.values()) {
+      const tool = entry.subAgentTools.find((t) => t.spec.name === toolId);
+      if (!tool) continue;
+      const res = await tool.handle(input);
+      return typeof res === 'string' ? res : res.output;
+    }
+    return undefined;
+  }
+
+  /** Synchronous capability probe for the deterministic-action fast-path.
+   *  The ui-orchestrator must decide BEFORE constructing its direct-events
+   *  generator whether a direct action can stream several sentinel-bearing
+   *  tool results. Keeping this as a cheap sync lookup lets the existing
+   *  single-invoke path stay byte-for-byte intact when no `runStream()` is
+   *  present.
+   *
+   *  Match semantics mirror invokeAgentTool(): both toolkit-tool shapes are
+   *  considered by id (`LocalSubAgentTool.spec.name` vs UploadedToolkit `id`),
+   *  but only the UploadedToolkit shape can carry `runStream()`. */
+  hasStreamingTool(toolId: string): boolean {
+    return this.findStreamingTool(toolId) !== undefined;
+  }
+
+  /** Invoke ONE active agent-plugin tool as a STREAM of raw result strings.
+   *  Each yielded chunk is JSON-stringified as-is so the caller can feed it
+   *  through the existing sentinel synthesis pipeline without understanding
+   *  `_pendingCanvasTree` / `_pendingSurfacePatch` itself. When no active
+   *  agent owns a streaming tool with this id, the generator yields nothing
+   *  and completes — the caller can then fall back to the non-streaming path. */
+  async *invokeAgentToolStream(toolId: string, input: unknown): AsyncGenerator<string> {
+    const tool = this.findStreamingTool(toolId);
+    if (!tool) return;
+    for await (const item of tool.runStream(input)) {
+      yield JSON.stringify(item);
+    }
+  }
+
+  private findStreamingTool(
+    toolId: string,
+  ):
+    | (Extract<UploadedToolkit['tools'][number], { id: string }> & {
+        runStream(input: unknown): AsyncGenerator<unknown>;
+      })
+    | undefined {
+    for (const entry of this.active.values()) {
+      const tool = entry.rawTools.find((candidate) => {
+        if (toolIdentifier(candidate) !== toolId) return false;
+        return isStreamingUploadedToolkitTool(candidate);
+      });
+      if (tool && isStreamingUploadedToolkitTool(tool)) return tool;
+    }
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +670,18 @@ function isLocalSubAgentTool(t: unknown): t is LocalSubAgentTool {
     'handle' in t &&
     typeof (t as { handle: unknown }).handle === 'function'
   );
+}
+
+function isStreamingUploadedToolkitTool(
+  t: UploadedToolkit['tools'][number],
+): t is Extract<UploadedToolkit['tools'][number], { id: string }> & {
+  runStream(input: unknown): AsyncGenerator<unknown>;
+} {
+  return !isLocalSubAgentTool(t) && typeof t.runStream === 'function';
+}
+
+function toolIdentifier(t: UploadedToolkit['tools'][number] | LocalSubAgentTool): string {
+  return isLocalSubAgentTool(t) ? t.spec.name : t.id;
 }
 
 function bridgeTool(

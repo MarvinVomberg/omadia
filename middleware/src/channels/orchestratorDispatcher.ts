@@ -95,11 +95,49 @@ export function createOrchestratorDispatcher(
         typeof input.metadata?.['canvasSessionId'] === 'string'
           ? (input.metadata['canvasSessionId'] as string)
           : undefined;
+      // The structured UI action (button click, choice pick) set by the canvas
+      // channel — protocol 1.0 §5.1's typed-field promise. The originating
+      // element's TargetRef rides along so Tier 2 knows WHICH element fired.
+      const rawAction = input.metadata?.['action'];
+      const action =
+        typeof rawAction === 'object' &&
+        rawAction !== null &&
+        typeof (rawAction as { type?: unknown }).type === 'string'
+          ? {
+              ...(rawAction as { type: string; payload?: unknown }),
+              ...(input.target !== undefined ? { target: input.target } : {}),
+            }
+          : undefined;
+      // Deterministic canvas refresh (omadia-ui#5) — same metadata ride as
+      // `action`; shape-validated by the channel, re-checked here.
+      const rawRefresh = input.metadata?.['canvasRefresh'];
+      const canvasRefresh =
+        typeof rawRefresh === 'object' &&
+        rawRefresh !== null &&
+        typeof (rawRefresh as { basedOnRevision?: unknown }).basedOnRevision === 'string'
+          ? (rawRefresh as { basedOnRevision: string; currentTree: unknown; scope?: string })
+          : undefined;
+      // PR-9b-3 in-place action — same metadata ride as `canvasRefresh`: the
+      // client's live tree so a canvas-aware orchestrator skips the skeleton
+      // and patches on top of it. Re-checked here (defence in depth).
+      const rawState = input.metadata?.['canvasState'];
+      const canvasState =
+        typeof rawState === 'object' &&
+        rawState !== null &&
+        typeof (rawState as { basedOnRevision?: unknown }).basedOnRevision === 'string'
+          ? (rawState as { basedOnRevision: string; currentTree: unknown })
+          : undefined;
       yield* agent.chatStream({
         userMessage: input.text,
         sessionScope: input.scope,
         userId: input.userRef.id,
         ...(canvasSessionId ? { canvasSessionId } : {}),
+        ...(action ? { action } : {}),
+        ...(canvasRefresh ? { canvasRefresh } : {}),
+        ...(canvasState ? { canvasState } : {}),
+        // a TEXT turn may be row-bound too (beam / context action) — thread
+        // the TargetRef even without a structured action.
+        ...(input.target !== undefined ? { target: input.target } : {}),
       });
     },
   };

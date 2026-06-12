@@ -4,6 +4,13 @@ import type { PluginContext } from '@omadia/plugin-api';
 import type { ChannelHandle, CoreApi } from '@omadia/channel-sdk';
 
 import { handleCanvasSocket } from './canvasConnection.js';
+import {
+  sanitizeCanvasList,
+  sanitizeDesktopList,
+  type CanvasListEntry,
+  type DesktopListEntry,
+  type NotificationMsg,
+} from './protocol.js';
 
 /**
  * @omadia/ui-channel — Omadia UI Tier-1 server-side channel (PR-10b).
@@ -62,6 +69,106 @@ export async function activate(
   // kernel wired a WebSocket registry into the CoreApi (PR-11). The kernel
   // authenticates each upgrade before this handler runs — `session` is the
   // verified identity; each connection is one canvas.
+  // Per-USER canvas registry (multi-canvas sidebar sync): persisted in the
+  // plugin memory store when the manifest grants it (survives restarts and is
+  // shared across server instances on a DB-backed memory); in-memory fallback
+  // otherwise so the wire contract still holds.
+  const memory = ctx.memory;
+  const volatileRegistry = new Map<string, CanvasListEntry[]>();
+  const registryPath = (subject: string): string =>
+    `canvases/${encodeURIComponent(subject)}.json`;
+  const canvasRegistry = {
+    async load(subject: string): Promise<CanvasListEntry[]> {
+      if (!memory) return volatileRegistry.get(subject) ?? [];
+      const rel = registryPath(subject);
+      if (!(await memory.exists(rel))) return [];
+      return sanitizeCanvasList(JSON.parse(await memory.readFile(rel)));
+    },
+    async save(subject: string, canvases: CanvasListEntry[]): Promise<void> {
+      if (!memory) {
+        volatileRegistry.set(subject, canvases);
+        return;
+      }
+      await memory.writeFile(registryPath(subject), JSON.stringify(canvases));
+    },
+  };
+  ctx.log(
+    `[omadia-ui-channel] canvas registry ${memory ? 'memory-backed' : 'VOLATILE (no memory permission)'}`,
+  );
+
+  // Per-USER desktop registry (multi-desktop workspaces): same persistence
+  // pattern as the canvas registry — desktops travel across installs.
+  const volatileDesktops = new Map<string, DesktopListEntry[]>();
+  const desktopPath = (subject: string): string =>
+    `desktops/${encodeURIComponent(subject)}.json`;
+  const desktopRegistry = {
+    async load(subject: string): Promise<DesktopListEntry[]> {
+      if (!memory) return volatileDesktops.get(subject) ?? [];
+      const rel = desktopPath(subject);
+      if (!(await memory.exists(rel))) return [];
+      return sanitizeDesktopList(JSON.parse(await memory.readFile(rel)));
+    },
+    async save(subject: string, desktops: DesktopListEntry[]): Promise<void> {
+      if (!memory) {
+        volatileDesktops.set(subject, desktops);
+        return;
+      }
+      await memory.writeFile(desktopPath(subject), JSON.stringify(desktops));
+    },
+  };
+
+  // Notifications (omadia-ui#15): live sinks per authenticated subject. The
+  // NotificationRouter handler below maps a middleware payload onto the wire
+  // `notification` message and fans it out to the target user's sockets —
+  // out-of-band from the canvas surface stream.
+  const notificationSinks = new Map<string, Set<(msg: unknown) => void>>();
+  const registerNotificationSink = (
+    subject: string,
+    sink: (msg: unknown) => void,
+  ): (() => void) => {
+    const set = notificationSinks.get(subject) ?? new Set();
+    set.add(sink);
+    notificationSinks.set(subject, set);
+    return () => {
+      set.delete(sink);
+      if (set.size === 0) notificationSinks.delete(subject);
+    };
+  };
+  const disposeNotificationChannel = ctx.notifications.registerChannel(
+    'omadia-ui',
+    async (payload) => {
+      const msg: NotificationMsg = {
+        type: 'notification',
+        id: randomUUID(),
+        // producer payloads carry no severity yet — default to info; the
+        // wire shape is ready for it (severity → UI element is fixed
+        // client-side: info/success toast, warning/error banner).
+        severity: 'info',
+        title: payload.title.slice(0, 120),
+        ...(payload.body ? { body: payload.body.slice(0, 1000) } : {}),
+        source: payload.pluginId,
+        dedupeKey: `${payload.pluginId}:${payload.title.slice(0, 120)}`,
+        ttlMs: 6000,
+      };
+      const targets =
+        payload.recipients === 'broadcast'
+          ? [...notificationSinks.values()]
+          : [...notificationSinks.entries()]
+              .filter(([subject]) => (payload.recipients as readonly string[]).includes(subject))
+              .map(([, sinks]) => sinks);
+      let delivered = 0;
+      for (const sinks of targets) {
+        for (const sink of sinks) {
+          sink(msg);
+          delivered += 1;
+        }
+      }
+      ctx.log(
+        `[omadia-ui-channel] notification from ${payload.pluginId} delivered to ${delivered} socket(s)`,
+      );
+    },
+  );
+
   if (wsAvailable) {
     const tenantId = ctx.services.get<string>('graphTenantId');
     core.registerWebSocket?.(ctx.agentId, CANVAS_PATH, (socket, session) => {
@@ -72,6 +179,14 @@ export async function activate(
         handleTurnStream: (turn) => core.handleTurnStream(turn),
         ...(tenantId ? { tenantId } : {}),
         mintId: () => randomUUID(),
+        canvasRegistry,
+        desktopRegistry,
+        registerNotificationSink,
+        onNotificationAck: (subject, id) => {
+          // v1: dismissal is client-persisted; server-side history sync is a
+          // later slice (issue #15 open question).
+          ctx.log(`[omadia-ui-channel] notification_ack ${id} from ${subject}`);
+        },
         log: (msg) => {
           ctx.log(msg);
         },
@@ -89,7 +204,10 @@ export async function activate(
       ctx.log('deactivating omadia-ui-channel');
       // Channel-scoped routes AND WebSocket registrations are torn down by the
       // kernel per channelId on deactivate (CoreApi contract) — the kernel also
-      // closes this channel's live canvas sockets. Nothing else to release.
+      // closes this channel's live canvas sockets. The NotificationRouter
+      // registration must be disposed explicitly (hot-swap contract).
+      disposeNotificationChannel();
+      notificationSinks.clear();
     },
   };
 }

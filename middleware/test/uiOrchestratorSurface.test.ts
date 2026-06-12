@@ -50,6 +50,17 @@ const toolUse = (id: string, name: string): ChatStreamEvent =>
   ({ type: 'tool_use', id, name, input: {} }) as unknown as ChatStreamEvent;
 const toolResult = (id: string, output: string): ChatStreamEvent =>
   ({ type: 'tool_result', id, output, durationMs: 1 }) as unknown as ChatStreamEvent;
+const subToolUse = (id: string, name: string): ChatStreamEvent =>
+  ({ type: 'sub_tool_use', parentId: 'q', id, name, input: {} }) as unknown as ChatStreamEvent;
+const subToolResult = (id: string, output: string): ChatStreamEvent =>
+  ({
+    type: 'sub_tool_result',
+    parentId: 'q',
+    id,
+    output,
+    durationMs: 1,
+    isError: false,
+  }) as unknown as ChatStreamEvent;
 
 const CANVAS_TREE_OUTPUT = JSON.stringify({
   prose: 'here is the table',
@@ -78,6 +89,41 @@ describe('canvasChatAgent surface synthesis', () => {
     // original events survive
     assert.ok(out.some((e) => e.type === 'tool_result'));
     assert.ok(out.some((e) => e.type === 'done'));
+  });
+
+  it('synthesises a surface_snapshot from a SUB-AGENT tool canvas sentinel', async () => {
+    // Agent-kind plugins (e.g. X Studio) emit their deterministic tree from a
+    // sub-tool inside the domain tool; the orchestrator forwards it as
+    // sub_tool_use/sub_tool_result. Authorisation matches on the sub-tool name.
+    const out = await collect(
+      synthesizeSurfaceEvents(
+        streamOf([
+          subToolUse('s1', 'x_studio_show_wizard'),
+          subToolResult('s1', CANVAS_TREE_OUTPUT),
+          { type: 'done', answer: 'x' } as unknown as ChatStreamEvent,
+        ]),
+        cfg(['x_studio_show_wizard']),
+      ),
+    );
+    const snap = out.find((e) => e.type === 'surface_snapshot');
+    assert.ok(snap, 'surface_snapshot emitted from sub-tool sentinel');
+    assert.deepEqual(field(snap, 'tree'), { type: 'p_text', id: 'x' });
+    assert.ok(out.some((e) => e.type === 'sub_tool_result'), 'sub_tool_result passes through');
+    assert.ok(out.some((e) => e.type === 'sub_tool_use'), 'sub_tool_use passes through');
+  });
+
+  it('denies an unauthorised SUB-AGENT tool (deny-by-default)', async () => {
+    const out = await collect(
+      synthesizeSurfaceEvents(
+        streamOf([
+          subToolUse('s1', 'untrusted_subtool'),
+          subToolResult('s1', CANVAS_TREE_OUTPUT),
+        ]),
+        cfg(['x_studio_show_wizard']),
+      ),
+    );
+    assert.ok(!out.some((e) => e.type === 'surface_snapshot'));
+    assert.ok(out.some((e) => e.type === 'sub_tool_result'), 'event still passes through');
   });
 
   it('does not synthesise when the tool is not authorised (deny-by-default)', async () => {
@@ -145,5 +191,69 @@ describe('canvasChatAgent surface synthesis', () => {
     assert.equal(field(snaps[1] as ChatStreamEvent, 'surfaceSeq'), 1);
     assert.equal(field(snaps[0] as ChatStreamEvent, 'producesRevision'), '0');
     assert.equal(field(snaps[1] as ChatStreamEvent, 'producesRevision'), '1');
+  });
+});
+
+const surfacePatchOutput = JSON.stringify({
+  prose: 'approved',
+  _pendingSurfacePatch: {
+    ops: [
+      { id: 'variant-0-review', set: { text: 'Self-Review: ✓ PASS', tone: 'success' } },
+      { id: 'd-1-status', set: { text: 'approved' } },
+    ],
+  },
+});
+
+describe('canvasChatAgent surface synthesis — ID-addressed surface patch (9b-3)', () => {
+  const baseTree = {
+    type: 'container',
+    id: 'root',
+    children: [
+      { type: 'pane', id: 'variant-0', children: [{ type: 'status', id: 'variant-0-review', text: 'Self-Review: ⚠ WARN', tone: 'warning' }] },
+      { type: 'status', id: 'd-1-status', text: 'draft' },
+    ],
+  };
+
+  it('emits a surface_patch that updates nodes by id without a snapshot', async () => {
+    const out = await collect(
+      synthesizeSurfaceEvents(
+        streamOf([toolUse('t1', 'studio_patch'), toolResult('t1', surfacePatchOutput)]),
+        { ...cfg(['studio_patch']), baseTree, baseRevision: '0' },
+      ),
+    );
+    const snap = out.find((e) => e.type === 'surface_snapshot');
+    assert.ok(!snap, 'no snapshot — patch only');
+    const patch = out.find((e) => e.type === 'surface_patch');
+    assert.ok(patch, 'surface_patch emitted');
+    assert.equal(field(patch, 'basedOnRevision'), '0');
+    const patches = field(patch, 'patches') as Array<{ op: string; path: string; value: unknown }>;
+    // both ids resolved to their JSON-Pointer paths and fields set
+    const byPath = Object.fromEntries(patches.map((p) => [p.path, p.value]));
+    assert.equal(byPath['/children/0/children/0/text'], 'Self-Review: ✓ PASS');
+    assert.equal(byPath['/children/0/children/0/tone'], 'success');
+    assert.equal(byPath['/children/1/text'], 'approved');
+  });
+
+  it('skips unmappable ids and emits nothing when none resolve', async () => {
+    const out = await collect(
+      synthesizeSurfaceEvents(
+        streamOf([
+          toolUse('t1', 'studio_patch'),
+          toolResult('t1', JSON.stringify({ prose: 'x', _pendingSurfacePatch: { ops: [{ id: 'ghost', set: { text: 'y' } }] } })),
+        ]),
+        { ...cfg(['studio_patch']), baseTree, baseRevision: '0' },
+      ),
+    );
+    assert.ok(!out.some((e) => e.type === 'surface_patch'), 'no patch for unmappable id');
+  });
+
+  it('does not patch when the tool is not authorised', async () => {
+    const out = await collect(
+      synthesizeSurfaceEvents(
+        streamOf([toolUse('t1', 'studio_patch'), toolResult('t1', surfacePatchOutput)]),
+        { ...cfg([]), baseTree, baseRevision: '0' },
+      ),
+    );
+    assert.ok(!out.some((e) => e.type === 'surface_patch'));
   });
 });

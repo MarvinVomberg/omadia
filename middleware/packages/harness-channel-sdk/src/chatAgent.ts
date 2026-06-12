@@ -269,6 +269,42 @@ export interface ChatTurnInput {
    * Tier 1 can correlate them to the right canvas. Never reaches the model prompt.
    */
   canvasSessionId?: string;
+  /**
+   * Structured UI action from an Omadia UI canvas client (button click,
+   * choice pick, row action) — the typed field promised in protocol 1.0 §5.1
+   * (until now the action rode `IncomingTurn.metadata.action` and was dropped
+   * at the dispatcher). Set only for canvas turns; a canvas-aware orchestrator
+   * threads it to the main turn as a `[canvas-action]` block. The optional
+   * `target` is the originating element's TargetRef, passed through untyped.
+   */
+  action?: { type: string; payload?: unknown; target?: unknown };
+  /**
+   * Omadia UI: the TargetRef a TEXT turn is bound to (beam on a row, context
+   * action) — protocol 1.0 §6. Threaded by the dispatcher for canvas turns
+   * whether or not a structured `action` rides along; a canvas-aware
+   * orchestrator hands it to the main turn as a `[canvas-target]` block so
+   * the agent never guesses which record the user meant.
+   */
+  target?: unknown;
+  /**
+   * Omadia UI deterministic refresh (protocol 1.1 `canvas_refresh`,
+   * omadia-ui#5): the client sends its CURRENT tree + revision; a
+   * canvas-aware orchestrator skips skeleton composition, derives the data
+   * requirements from that tree's own containers and re-fetches ONLY — the
+   * first publish per container REPLACES its stale rows. `scope` narrows the
+   * refresh to one container id. Set only by the canvas channel.
+   */
+  canvasRefresh?: { basedOnRevision: string; currentTree: unknown; scope?: string };
+  /**
+   * Omadia UI in-place action (PR-9b-3): on a structured ACTION turn the client
+   * sends its CURRENT tree + revision so a canvas-aware orchestrator can SKIP
+   * skeleton composition and synthesise on top of that live tree — a plugin
+   * status-flip then lands as a `surface_patch` (no remount), while a full
+   * recompose still replaces the tree via a snapshot. Mirrors `canvasRefresh`'s
+   * base-tree handoff but keeps the normal main turn (the action is acted on).
+   * Set only by the canvas channel; absent → the skeleton path is unchanged.
+   */
+  canvasState?: { basedOnRevision: string; currentTree: unknown };
 }
 
 /**
