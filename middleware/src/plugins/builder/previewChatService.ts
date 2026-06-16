@@ -19,6 +19,7 @@ import { zodToJsonSchema } from '../zodToJsonSchema.js';
 import { compileBoundariesSection } from './boundaryPresets.js';
 import {
   composeContextualMessage,
+  type BuilderProviderResolution,
   type BuilderProviderResolver,
 } from './builderAgent.js';
 import type { DraftStore } from './draftStore.js';
@@ -60,7 +61,8 @@ export type PreviewChatEvent =
       isError: boolean;
       durationMs: number;
     }
-  | { type: 'turn_done'; turnId: string };
+  | { type: 'turn_done'; turnId: string }
+  | { type: 'error'; code: string; message: string };
 
 const DEFAULT_MAX_TOKENS = 4096;
 const DEFAULT_MAX_ITERATIONS = 8;
@@ -168,7 +170,17 @@ export class PreviewChatService {
       previewTranscript: transcriptWithUser,
     });
 
-    const resolved = await this.resolveProvider(opts.modelChoice);
+    let resolved: BuilderProviderResolution;
+    try {
+      resolved = await this.resolveProvider(opts.modelChoice);
+    } catch (err) {
+      yield {
+        type: 'error',
+        code: 'builder.model_unavailable',
+        message: err instanceof Error ? err.message : String(err),
+      };
+      return;
+    }
 
     const tools = opts.handle.toolkit.tools.map(bridgePreviewTool);
     const systemPrompt = await this.systemPromptFor(

@@ -287,21 +287,26 @@ export function createBuilderRouter(deps: BuilderRouterDeps): Router {
 
   // ── GET /models ─────────────────────────────────────────────────────────
   router.get('/models', async (_req: Request, res: Response) => {
-    const connected = deps.connectedProviders
-      ? await deps.connectedProviders()
-      : null;
-    const models = BuilderModelRegistry.list()
-      .filter((m) => connected === null || connected.has(m.provider))
-      .map((m) => ({
-        id: m.id,
-        label: m.label,
-        provider: m.provider,
-        model_class: m.modelClass,
-        vision: m.vision,
-        description: m.description,
-        max_tokens: m.maxTokens,
-      }));
-    res.json({ models, default: BuilderModelRegistry.default() });
+    try {
+      const connected = deps.connectedProviders
+        ? await deps.connectedProviders()
+        : null;
+      const models = BuilderModelRegistry.list()
+        .filter((m) => connected === null || connected.has(m.provider))
+        .map((m) => ({
+          id: m.id,
+          label: m.label,
+          provider: m.provider,
+          model_class: m.modelClass,
+          vision: m.vision,
+          description: m.description,
+          max_tokens: m.maxTokens,
+          aliases: m.aliases,
+        }));
+      res.json({ models, default: BuilderModelRegistry.default() });
+    } catch (err) {
+      sendError(res, err, 'builder.models_failed');
+    }
   });
 
   // ── GET /drafts ─────────────────────────────────────────────────────────

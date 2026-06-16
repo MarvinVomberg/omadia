@@ -20,6 +20,7 @@ export interface BuilderModel {
   vision: boolean;
   maxTokens: number;
   description: string;
+  aliases: readonly string[];
 }
 
 /** Generic chat-transcript entry. Refined in B.4 with tool-use events. */

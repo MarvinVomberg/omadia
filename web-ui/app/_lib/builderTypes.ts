@@ -29,6 +29,7 @@ export interface BuilderModelInfo {
   vision: boolean;
   description: string;
   max_tokens: number;
+  aliases: string[];
 }
 
 export interface ListBuilderModelsResponse {

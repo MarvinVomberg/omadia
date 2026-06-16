@@ -1040,13 +1040,13 @@ async function main(): Promise<void> {
   // harmless when the key was already present via env. `ctx.llm` resolves the
   // 'llm' provider at call time, so already-active plugins pick up the swap on
   // their next call without re-activation.
-  const ANTHROPIC_SHARED_CLIENT_SOURCE = '@omadia/orchestrator';
+  const ORCHESTRATOR_SECRET_SOURCE = '@omadia/orchestrator';
   // The key currently baked into the shared `llm`/`anthropicClient` providers.
   // Seeded with the boot-time ENV key (line ~288). Updated whenever we swap the
   // providers, so we only churn the Anthropic client when the key truly changes.
   let sharedAnthropicKeyApplied = config.ANTHROPIC_API_KEY ?? '';
   const refreshSharedAnthropicClientFromVault = async (
-    sourceAgentId: string = ANTHROPIC_SHARED_CLIENT_SOURCE,
+    sourceAgentId: string = ORCHESTRATOR_SECRET_SOURCE,
   ): Promise<void> => {
     try {
       const key = await readProviderApiKey(
@@ -1080,7 +1080,7 @@ async function main(): Promise<void> {
     // plugin's vault was just (re)seeded. Re-source the shared providers so any
     // plugin reaching the host LLM via `ctx.llm` picks up the real key without
     // a restart.
-    if (agentId === ANTHROPIC_SHARED_CLIENT_SOURCE) {
+    if (agentId === ORCHESTRATOR_SECRET_SOURCE) {
       await refreshSharedAnthropicClientFromVault(agentId);
     }
   };
@@ -2715,7 +2715,7 @@ async function main(): Promise<void> {
     }
     const provider = await resolveLlmProvider({
       providerId,
-      getSecret: (k) => secretVault.get(ANTHROPIC_SHARED_CLIENT_SOURCE, k),
+      getSecret: (k) => secretVault.get(ORCHESTRATOR_SECRET_SOURCE, k),
       maxRetries: 5,
       catalog: llmProviderCatalog,
     });
@@ -2730,32 +2730,28 @@ async function main(): Promise<void> {
   };
 
   const builderConnectedProviders = async (): Promise<ReadonlySet<string>> => {
-    const providerIds = new Set(
-      BuilderModelRegistry.list().map((m) => m.provider),
+    const providerIds = [
+      ...new Set(BuilderModelRegistry.list().map((m) => m.provider)),
+    ];
+    const checks = await Promise.all(
+      providerIds.map(async (providerId) => {
+        const descriptor = llmProviderCatalog.get(providerId);
+        if (descriptor?.policy?.requiresApiKey === false) return providerId;
+        const key = await readProviderApiKey(
+          (k) => secretVault.get(ORCHESTRATOR_SECRET_SOURCE, k),
+          providerId,
+        );
+        if (key) return providerId;
+        if (
+          providerId === 'anthropic' &&
+          (config.ANTHROPIC_API_KEY ?? '').trim().length > 0
+        ) {
+          return providerId;
+        }
+        return null;
+      }),
     );
-    const connected = new Set<string>();
-    for (const providerId of providerIds) {
-      const descriptor = llmProviderCatalog.get(providerId);
-      if (descriptor?.policy?.requiresApiKey === false) {
-        connected.add(providerId);
-        continue;
-      }
-      const key = await readProviderApiKey(
-        (k) => secretVault.get(ANTHROPIC_SHARED_CLIENT_SOURCE, k),
-        providerId,
-      );
-      if (key) {
-        connected.add(providerId);
-        continue;
-      }
-      if (
-        providerId === 'anthropic' &&
-        (config.ANTHROPIC_API_KEY ?? '').trim().length > 0
-      ) {
-        connected.add(providerId);
-      }
-    }
-    return connected;
+    return new Set(checks.filter((p): p is string => p !== null));
   };
 
   const previewChatService = new PreviewChatService({

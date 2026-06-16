@@ -17,6 +17,7 @@ const SLUG_FALLBACK: Readonly<
     modelClass: 'fast',
     vision: true,
     maxTokens: 8192,
+    aliases: ['haiku'],
   },
   sonnet: {
     id: 'anthropic:claude-sonnet-4-6',
@@ -26,6 +27,7 @@ const SLUG_FALLBACK: Readonly<
     modelClass: 'balanced',
     vision: true,
     maxTokens: 16_384,
+    aliases: ['sonnet'],
   },
   opus: {
     id: 'anthropic:claude-opus-4-8',
@@ -35,6 +37,7 @@ const SLUG_FALLBACK: Readonly<
     modelClass: 'frontier',
     vision: true,
     maxTokens: 16_384,
+    aliases: ['opus'],
   },
 };
 
@@ -59,6 +62,7 @@ function infoToBuilderModel(info: ModelInfo): BuilderModel {
     vision: info.vision,
     maxTokens: info.maxTokens,
     description: describeClass(info.class),
+    aliases: info.aliases ?? [],
   };
 }
 

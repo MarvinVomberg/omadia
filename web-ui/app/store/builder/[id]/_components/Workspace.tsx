@@ -91,9 +91,16 @@ const TAB_KEY: Record<EditorTab, string> = {
 };
 
 // Model names are brand proper nouns — not translated. Resolved against the
-// provider-supplied model list; falls back to the raw reference.
+// provider-supplied model list (by id or alias), then the legacy builder
+// slugs, then the raw reference.
+const SLUG_LABEL: Record<string, string> = {
+  haiku: 'Haiku',
+  sonnet: 'Sonnet',
+  opus: 'Opus',
+};
 function modelLabel(models: BuilderModelInfo[], id: BuilderModelId): string {
-  return models.find((m) => m.id === id)?.label ?? id;
+  const match = models.find((m) => m.id === id || m.aliases.includes(id));
+  return match?.label ?? SLUG_LABEL[id] ?? id;
 }
 
 // Draft-status → i18n key under `builder.workspace`.
@@ -1575,7 +1582,9 @@ function ModelSelector({
     );
   }
   const providers = [...new Set(models.map((m) => m.provider))];
-  const valueInList = models.some((m) => m.id === value);
+  const canonicalValue =
+    models.find((m) => m.id === value || m.aliases.includes(value))?.id ?? value;
+  const valueInList = models.some((m) => m.id === canonicalValue);
   return (
     <label className="flex items-baseline gap-2">
       <span className="text-[10px] font-semibold uppercase tracking-[0.2em] text-[color:var(--fg-subtle)]">
@@ -1583,7 +1592,7 @@ function ModelSelector({
       </span>
       <span className="relative inline-flex items-center">
         <select
-          value={value}
+          value={canonicalValue}
           onChange={(e) => {
             void onChange(e.target.value);
           }}
@@ -1595,7 +1604,9 @@ function ModelSelector({
           aria-label={tw('modelSwitchAria', { label })}
         >
           {!valueInList && (
-            <option value={value}>{modelLabel(models, value)}</option>
+            <option value={canonicalValue}>
+              {modelLabel(models, canonicalValue)}
+            </option>
           )}
           {providers.map((provider) => (
             <optgroup key={provider} label={provider}>
