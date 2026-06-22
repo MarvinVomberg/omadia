@@ -175,6 +175,10 @@ import { createAdminAuthRouter } from './routes/adminAuth.js';
 import { PluginCatalog } from './plugins/manifestLoader.js';
 import { FileInstalledRegistry } from './plugins/fileInstalledRegistry.js';
 import { InstallService } from './plugins/installService.js';
+import {
+  OAuthBrokerService,
+  PendingFlowStore,
+} from './plugins/oauth/index.js';
 import { DynamicAgentRuntime } from './plugins/dynamicAgentRuntime.js';
 import { JobScheduler } from './plugins/jobScheduler.js';
 import { MigrationRunner } from './plugins/migrationRunner.js';
@@ -1242,6 +1246,12 @@ async function main(): Promise<void> {
       /^\/api\/v1\/auth(?:\/|$|\?)/,
       /^\/api\/v1\/setup(?:\/|$|\?)/,
       /^\/api\/auth(?:\/|$|\?)/,
+      // Spec 005 — kernel OAuth broker callback. The IdP redirects the
+      // operator's browser back here after consent; the session cookie may
+      // have lapsed during the round-trip, so the route is public and
+      // self-secures via the signed, single-use `state` token. `/oauth/start`
+      // is NOT listed — it stays behind the cookie gate (operator-initiated).
+      /^\/api\/v1\/install\/oauth\/callback(?:\/|$|\?)/,
       // Bot Framework webhook for channel-teams. The Teams adapter
       // validates the Bot-issued JWT inside the handler; the session
       // cookie check would silently drop every inbound activity because
@@ -2257,12 +2267,30 @@ async function main(): Promise<void> {
   );
   console.log('[middleware] plugin store endpoints ready at /api/v1/store/plugins (auth: required)');
 
+  // Spec 005 — kernel OAuth broker. Drives standard authorization-code flows
+  // for plugins that declare an `oauth_providers` descriptor + a `type:oauth`
+  // field. Mounted on the install router; `/oauth/callback` is public (see
+  // publicPaths) and self-secures via signed state.
+  const oauthBroker = new OAuthBrokerService({
+    catalog: pluginCatalog,
+    registry: installedRegistry,
+    vault: secretVault,
+    pendingFlows: new PendingFlowStore(),
+    signingKey: sessionSigningKey,
+    publicBaseUrl: flowPublicBaseUrl,
+    // Re-resolve the plugin's connection state (derived config + ctx.status)
+    // immediately after a successful connect — same deactivate→activate the
+    // install flow uses, so the status badge clears without a restart.
+    reactivatePlugin: (pluginId) => installService.reactivate(pluginId),
+  });
+
   app.use(
     '/api/v1/install',
     requireAuth,
-    createInstallRouter({ service: installService }),
+    createInstallRouter({ service: installService, oauthBroker }),
   );
   console.log('[middleware] plugin install endpoints ready at /api/v1/install (auth: required)');
+  console.log('[middleware] OAuth broker ready at /api/v1/install/oauth/{start,callback}');
 
   // Phase 2.1.5 — live profile storage (agent.md + knowledge bytes). Mounted
   // only when graphPool exists; tests/in-memory boot fall back to the
