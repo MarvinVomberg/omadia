@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createAnthropicClient,
+  createAnthropicProvider,
   registerAnthropicAdapter,
   type AnthropicClient,
 } from '@omadia/llm-adapter-anthropic';
@@ -11,6 +12,7 @@ import {
   defaultLlmAdapters,
   LlmProviderCatalog,
   readProviderApiKey,
+  resolveLlmProvider,
 } from '@omadia/llm-provider';
 import express from 'express';
 import cookieParser from 'cookie-parser';
@@ -93,7 +95,10 @@ import { PreviewCache } from './plugins/builder/previewCache.js';
 import { PreviewSecretBuffer } from './plugins/builder/previewSecretBuffer.js';
 import { PreviewRebuildScheduler } from './plugins/builder/previewRebuildScheduler.js';
 import { PreviewChatService } from './plugins/builder/previewChatService.js';
-import { BuilderAgent } from './plugins/builder/builderAgent.js';
+import {
+  BuilderAgent,
+  type BuilderProviderResolver,
+} from './plugins/builder/builderAgent.js';
 import { BuilderTriageLog } from './plugins/builder/builderTriageLog.js';
 import { GithubIssueCache } from './plugins/builder/githubIssueCache.js';
 import { GithubIssueCreator } from './plugins/builder/githubIssueCreator.js';
@@ -1080,13 +1085,13 @@ async function main(): Promise<void> {
   // harmless when the key was already present via env. `ctx.llm` resolves the
   // 'llm' provider at call time, so already-active plugins pick up the swap on
   // their next call without re-activation.
-  const ANTHROPIC_SHARED_CLIENT_SOURCE = '@omadia/orchestrator';
+  const ORCHESTRATOR_SECRET_SOURCE = '@omadia/orchestrator';
   // The key currently baked into the shared `llm`/`anthropicClient` providers.
   // Seeded with the boot-time ENV key (line ~288). Updated whenever we swap the
   // providers, so we only churn the Anthropic client when the key truly changes.
   let sharedAnthropicKeyApplied = config.ANTHROPIC_API_KEY ?? '';
   const refreshSharedAnthropicClientFromVault = async (
-    sourceAgentId: string = ANTHROPIC_SHARED_CLIENT_SOURCE,
+    sourceAgentId: string = ORCHESTRATOR_SECRET_SOURCE,
   ): Promise<void> => {
     try {
       const key = await readProviderApiKey(
@@ -1120,7 +1125,7 @@ async function main(): Promise<void> {
     // plugin's vault was just (re)seeded. Re-source the shared providers so any
     // plugin reaching the host LLM via `ctx.llm` picks up the real key without
     // a restart.
-    if (agentId === ANTHROPIC_SHARED_CLIENT_SOURCE) {
+    if (agentId === ORCHESTRATOR_SECRET_SOURCE) {
       await refreshSharedAnthropicClientFromVault(agentId);
     }
   };
@@ -2767,8 +2772,58 @@ async function main(): Promise<void> {
     `[middleware] bootstrap profile endpoints ready at /api/v1/profiles (auth: required, live-storage: ${liveProfileStorage ? 'on' : 'off'}, snapshots: ${snapshotService ? 'on' : 'off'})`,
   );
 
+  const resolveBuilderProvider: BuilderProviderResolver = async (modelRef) => {
+    const { provider: providerId, modelId } =
+      BuilderModelRegistry.resolve(modelRef);
+    if (providerId === 'anthropic') {
+      return {
+        provider: createAnthropicProvider({ client: currentAnthropicClient() }),
+        modelId,
+      };
+    }
+    const provider = await resolveLlmProvider({
+      providerId,
+      getSecret: (k) => secretVault.get(ORCHESTRATOR_SECRET_SOURCE, k),
+      maxRetries: 5,
+      catalog: llmProviderCatalog,
+    });
+    if (!provider) {
+      throw new Error(
+        `Builder-Modell '${modelRef}' nutzt Provider '${providerId}', für den kein ` +
+          `API-Key hinterlegt ist. Konfiguriere den Provider auf der Modelle-Seite ` +
+          `und versuche es erneut.`,
+      );
+    }
+    return { provider, modelId };
+  };
+
+  const builderConnectedProviders = async (): Promise<ReadonlySet<string>> => {
+    const providerIds = [
+      ...new Set(BuilderModelRegistry.list().map((m) => m.provider)),
+    ];
+    const checks = await Promise.all(
+      providerIds.map(async (providerId) => {
+        const descriptor = llmProviderCatalog.get(providerId);
+        if (descriptor?.policy?.requiresApiKey === false) return providerId;
+        const key = await readProviderApiKey(
+          (k) => secretVault.get(ORCHESTRATOR_SECRET_SOURCE, k),
+          providerId,
+        );
+        if (key) return providerId;
+        if (
+          providerId === 'anthropic' &&
+          (config.ANTHROPIC_API_KEY ?? '').trim().length > 0
+        ) {
+          return providerId;
+        }
+        return null;
+      }),
+    );
+    return new Set(checks.filter((p): p is string => p !== null));
+  };
+
   const previewChatService = new PreviewChatService({
-    anthropic: currentAnthropicClient,
+    resolveProvider: resolveBuilderProvider,
     draftStore,
     logger: () => {},
   });
@@ -2986,7 +3041,7 @@ async function main(): Promise<void> {
     `${builderPlatformPkg.version ?? '0.0.0'} (process booted ${new Date().toISOString()})`;
 
   const builderAgent = new BuilderAgent({
-    anthropic: currentAnthropicClient,
+    resolveProvider: resolveBuilderProvider,
     draftStore,
     bus: builderSpecBus,
     rebuildScheduler: {
@@ -3040,8 +3095,7 @@ async function main(): Promise<void> {
     bus: builderSpecBus,
     draftStore,
     builderAgent,
-    defaultModel: BuilderModelRegistry.get(BuilderModelRegistry.default()).anthropicModelId,
-    resolveModelId: (id) => BuilderModelRegistry.get(id).anthropicModelId,
+    defaultModel: BuilderModelRegistry.default(),
     turnRingBuffer: builderTurnRingBuffer,
     logger: (...args: unknown[]) => {
       console.log('[builder/auto-fix]', ...args);
@@ -3079,6 +3133,7 @@ async function main(): Promise<void> {
     createBuilderRouter({
       store: draftStore,
       quota: draftQuota,
+      connectedProviders: builderConnectedProviders,
       preview: {
         draftStore,
         previewCache,
