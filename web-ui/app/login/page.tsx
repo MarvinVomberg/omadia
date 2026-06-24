@@ -9,6 +9,7 @@ import { Button } from '../_components/ui/Button';
 import {
   ApiError,
   getAuthProviders,
+  getSessionStatus,
   postAuthLogin,
   type AuthProviderSummary,
 } from '../_lib/api';
@@ -76,6 +77,12 @@ function LoginPageInner(): React.ReactElement {
     let cancelled = false;
     (async () => {
       try {
+        const session = await getSessionStatus();
+        if (cancelled) return;
+        if (session.authenticated) {
+          router.replace(returnPath);
+          return;
+        }
         const res = await getAuthProviders();
         if (cancelled) return;
         if (res.setup_required) {
